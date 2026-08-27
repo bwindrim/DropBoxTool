@@ -43,11 +43,17 @@ Use `--yaml` for structured metadata output:
 python3 dropbox_ls.py --yaml
 ```
 
-This outputs a YAML list with `type`, `name`, `size`, and `content_hash`
-fields. Filenames are always quoted and escaped as YAML strings, so whitespace
-and special characters are preserved. Folder-only fields are `null`. The
-`--show-size`, `--show-hash`, and `--size-bytes` flags apply to the default
-tab-separated output.
+This outputs a YAML list with commonly-used Dropbox metadata. Shared fields
+include `id`, `name`, `path_lower`, `path_display`,
+`parent_shared_folder_id`, and `preview_url`. File entries also include
+timestamps, `rev`, `size`, `is_downloadable`, `content_hash`, sharing and
+locking metadata, and other available file properties. Folder entries include
+`shared_folder_id`, sharing metadata, and property groups. Timestamps are
+serialized as ISO 8601 strings. Filenames are always quoted and escaped as
+YAML strings, so whitespace and special characters are preserved. Metadata
+that Dropbox does not provide is represented as `null`. The `--show-size`,
+`--show-hash`, and `--size-bytes` flags apply to the default tab-separated
+output.
 
 Or keep the token out of shell history by using an environment variable:
 
