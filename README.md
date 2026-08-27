@@ -43,6 +43,19 @@ Use `--yaml` for structured metadata output:
 python3 dropbox_ls.py --yaml
 ```
 
+To query specific files or folders instead of listing the root, provide one or
+more Dropbox paths after the options:
+
+```sh
+python3 dropbox_ls.py /Documents /Photos/photo.jpg --yaml
+```
+
+Each supplied path is queried with a read-only metadata request. Ordinary paths
+may be written with or without a leading `/`; the program adds it when needed.
+Dropbox identifiers using `id:`, `rev:`, or `ns:` are passed through unchanged.
+If no paths are supplied, the program lists the complete top-level contents as
+before.
+
 This outputs a YAML list with commonly-used Dropbox metadata. Shared fields
 include `id`, `name`, `path_lower`, `path_display`,
 `parent_shared_folder_id`, and `preview_url`. File entries also include

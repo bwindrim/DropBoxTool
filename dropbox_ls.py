@@ -77,6 +77,13 @@ def serialize_metadata(value: Any) -> Any:
     return str(value)
 
 
+def normalize_dropbox_path(path: str) -> str:
+    """Make a user-supplied path valid for Dropbox metadata endpoints."""
+    if path.startswith(("/", "id:", "rev:", "ns:")):
+        return path
+    return f"/{path}"
+
+
 def entry_metadata(entry: Any, entry_type: str) -> dict[str, Any]:
     fields = COMMON_METADATA_FIELDS + (
         FILE_METADATA_FIELDS if entry_type == "file" else FOLDER_METADATA_FIELDS
@@ -134,33 +141,55 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Output structured YAML metadata instead of tab-separated text.",
     )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        metavar="PATH",
+        help="Dropbox file or folder paths to query instead of listing the root.",
+    )
     return parser.parse_args(argv)
 
 
 def list_top_level(
     access_token: str,
+    paths: Sequence[str] = (),
 ) -> list[tuple[str, str, int | None, str | None, dict[str, Any]]]:
-    """Return type, display fields, and complete metadata for root entries.
+    """Return type, display fields, and complete metadata for requested entries.
 
-    The Dropbox SDK call used here is read-only: files_list_folder reads
-    directory metadata and requires the app's files.metadata.read scope.
+    With no paths, files_list_folder reads root directory metadata. With paths,
+    files_get_metadata reads metadata for each specified file or folder. Both
+    calls are read-only and require the files.metadata.read scope.
     """
     client = dropbox.Dropbox(oauth2_access_token=access_token)
 
     entries: list[tuple[str, str, int | None, str | None, dict[str, Any]]] = []
+
+    def add_entry(entry: Any) -> None:
+        entry_type = "folder" if isinstance(entry, FolderMetadata) else "file"
+        entries.append(
+            (
+                entry_type,
+                entry.name,
+                getattr(entry, "size", None),
+                getattr(entry, "content_hash", None),
+                entry_metadata(entry, entry_type),
+            )
+        )
+
+    if paths:
+        for path in paths:
+            add_entry(
+                client.files_get_metadata(
+                    normalize_dropbox_path(path),
+                    include_has_explicit_shared_members=True,
+                )
+            )
+        return entries
+
     result = client.files_list_folder("", include_has_explicit_shared_members=True)
     while True:
         for entry in result.entries:
-            entry_type = "folder" if isinstance(entry, FolderMetadata) else "file"
-            entries.append(
-                (
-                    entry_type,
-                    entry.name,
-                    getattr(entry, "size", None),
-                    getattr(entry, "content_hash", None),
-                    entry_metadata(entry, entry_type),
-                )
-            )
+            add_entry(entry)
         if not result.has_more:
             break
         result = client.files_list_folder_continue(result.cursor)
@@ -177,7 +206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        entries = list_top_level(args.access_token)
+        entries = list_top_level(args.access_token, args.paths)
     except AuthError:
         print(
             "Error: Dropbox rejected the token. Check that it is valid and has "
