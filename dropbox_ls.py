@@ -242,8 +242,37 @@ def list_top_level(
         result = client.files_list_folder_continue(result.cursor)
     return entries
 
+def print_yaml(entries: list[tuple[str, str, int | None, str | None, dict[str, Any]]]) -> None:
+    """Print structured YAML metadata for the given entries."""
+    print(
+        yaml.dump(
+            [
+                {"type": entry_type, **metadata, "name": QuotedString(name)}
+                for entry_type, name, _size, _content_hash, metadata in entries
+            ],
+            Dumper=QuotedSafeDumper,
+            sort_keys=False,
+            default_flow_style=False,
+        ),
+        end="",
+    )
+
+
+def print_text(entries: list[tuple[str, str, int | None, str | None, dict[str, Any]]]) -> None:
+    """Print tab-separated text for the given entries."""
+    for entry_type, name, size, content_hash, _metadata in entries:
+        columns = [entry_type, name]
+        if args.show_size:
+            columns.append(
+                "-" if size is None else format_size(size, as_bytes=args.size_bytes)
+            )
+        if args.show_hash:
+            columns.append("-" if content_hash is None else content_hash)
+        print("\t".join(columns))
+
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global args
     args = parse_args(argv)
     if not args.access_token:
         print(
@@ -273,29 +302,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sorted_entries = sorted(entries, key=lambda item: (item[0] != "folder", item[1].casefold()))
     if args.yaml:
-        print(
-            yaml.dump(
-                [
-                    {"type": entry_type, **metadata, "name": QuotedString(name)}
-                    for entry_type, name, _size, _content_hash, metadata in sorted_entries
-                ],
-                Dumper=QuotedSafeDumper,
-                sort_keys=False,
-                default_flow_style=False,
-            ),
-            end="",
-        )
-        return 0
+        print_yaml(sorted_entries)
+    else:
+        print_text(sorted_entries)
 
-    for entry_type, name, size, content_hash, _metadata in sorted_entries:
-        columns = [entry_type, name]
-        if args.show_size:
-            columns.append(
-                "-" if size is None else format_size(size, as_bytes=args.size_bytes)
-            )
-        if args.show_hash:
-            columns.append("-" if content_hash is None else content_hash)
-        print("\t".join(columns))
     return 0
 
 
