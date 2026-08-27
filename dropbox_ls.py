@@ -13,6 +13,21 @@ from dropbox.exceptions import AuthError, DropboxException
 from dropbox.files import FolderMetadata
 
 
+def format_size(size: int, as_bytes: bool = False) -> str:
+    """Format a byte count for display using IEC units unless requested raw."""
+    if as_bytes:
+        return str(size)
+    if size < 1024:
+        return f"{size} B"
+
+    value = float(size)
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        value /= 1024
+        if value < 1024 or unit == "PiB":
+            return f"{value:.1f} {unit}"
+    return f"{size} B"  # Unreachable, but keeps the function total.
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="List top-level folders and files in Dropbox (read-only)."
@@ -22,22 +37,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=os.getenv("DROPBOX_ACCESS_TOKEN"),
         help="Dropbox OAuth access token (or set DROPBOX_ACCESS_TOKEN).",
     )
+    parser.add_argument(
+        "--show-size",
+        action="store_true",
+        help="Include file size in human-readable form (folders show '-').",
+    )
+    parser.add_argument(
+        "--size-bytes",
+        action="store_true",
+        help="Print sizes as raw bytes instead of human-readable units.",
+    )
+    parser.add_argument(
+        "--show-hash",
+        action="store_true",
+        help="Include Dropbox content hash (folders show '-').",
+    )
     return parser.parse_args(argv)
 
 
-def list_top_level(access_token: str) -> list[tuple[str, str]]:
-    """Return (type, name) pairs for the account's root folder.
+def list_top_level(access_token: str) -> list[tuple[str, str, int | None, str | None]]:
+    """Return (type, name, size, content_hash) tuples for the root folder.
 
     The Dropbox SDK call used here is read-only: files_list_folder reads
     directory metadata and requires the app's files.metadata.read scope.
     """
     client = dropbox.Dropbox(oauth2_access_token=access_token)
 
-    entries: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, int | None, str | None]] = []
     result = client.files_list_folder("")
     while True:
         entries.extend(
-            ("folder" if isinstance(entry, FolderMetadata) else "file", entry.name)
+            (
+                "folder" if isinstance(entry, FolderMetadata) else "file",
+                entry.name,
+                getattr(entry, "size", None),
+                getattr(entry, "content_hash", None),
+            )
             for entry in result.entries
         )
         if not result.has_more:
@@ -68,8 +103,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Error communicating with Dropbox: {exc}", file=sys.stderr)
         return 1
 
-    for entry_type, name in sorted(entries, key=lambda item: (item[0] != "folder", item[1].casefold())):
-        print(f"{entry_type}\t{name}")
+    for entry_type, name, size, content_hash in sorted(
+        entries, key=lambda item: (item[0] != "folder", item[1].casefold())
+    ):
+        columns = [entry_type, name]
+        if args.show_size:
+            columns.append(
+                "-" if size is None else format_size(size, as_bytes=args.size_bytes)
+            )
+        if args.show_hash:
+            columns.append("-" if content_hash is None else content_hash)
+        print("\t".join(columns))
     return 0
 
 

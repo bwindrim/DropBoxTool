@@ -24,6 +24,19 @@ Pass the token directly:
 python3 dropbox_ls.py --access-token 'your-token'
 ```
 
+Add optional file metadata with either or both flags. Sizes are human-readable
+by default:
+
+```sh
+python3 dropbox_ls.py --show-size --show-hash
+```
+
+Use `--size-bytes` with `--show-size` to print raw byte counts:
+
+```sh
+python3 dropbox_ls.py --show-size --size-bytes
+```
+
 Or keep the token out of shell history by using an environment variable:
 
 ```sh
@@ -38,6 +51,11 @@ folder\tDocuments
 folder\tPhotos
 file\tgetting-started.pdf
 ```
+
+With `--show-size`, the third column is the file size in human-readable IEC
+units (for example, `1.5 KiB`). With `--size-bytes`, it is printed as raw
+bytes. With `--show-hash`, the next column is Dropbox's content hash. Folders
+show `-` for these file-only fields.
 
 The program follows Dropbox pagination automatically, so all top-level entries
 are listed even when the account has more than one page of results.
