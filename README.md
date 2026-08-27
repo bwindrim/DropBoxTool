@@ -37,6 +37,18 @@ Use `--size-bytes` with `--show-size` to print raw byte counts:
 python3 dropbox_ls.py --show-size --size-bytes
 ```
 
+Use `--yaml` for structured metadata output:
+
+```sh
+python3 dropbox_ls.py --yaml
+```
+
+This outputs a YAML list with `type`, `name`, `size`, and `content_hash`
+fields. Filenames are always quoted and escaped as YAML strings, so whitespace
+and special characters are preserved. Folder-only fields are `null`. The
+`--show-size`, `--show-hash`, and `--size-bytes` flags apply to the default
+tab-separated output.
+
 Or keep the token out of shell history by using an environment variable:
 
 ```sh

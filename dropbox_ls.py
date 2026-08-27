@@ -9,8 +9,26 @@ import sys
 from collections.abc import Sequence
 
 import dropbox
+import yaml
 from dropbox.exceptions import AuthError, DropboxException
 from dropbox.files import FolderMetadata
+
+
+class QuotedString(str):
+    """String marker used to force quoting for filenames in YAML."""
+
+
+class QuotedSafeDumper(yaml.SafeDumper):
+    """YAML dumper with support for explicitly quoted strings."""
+
+
+def represent_quoted_string(
+    dumper: yaml.SafeDumper, value: QuotedString
+) -> yaml.nodes.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+QuotedSafeDumper.add_representer(QuotedString, represent_quoted_string)
 
 
 def format_size(size: int, as_bytes: bool = False) -> str:
@@ -51,6 +69,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--show-hash",
         action="store_true",
         help="Include Dropbox content hash (folders show '-').",
+    )
+    parser.add_argument(
+        "--yaml",
+        action="store_true",
+        help="Output structured YAML metadata instead of tab-separated text.",
     )
     return parser.parse_args(argv)
 
@@ -103,9 +126,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Error communicating with Dropbox: {exc}", file=sys.stderr)
         return 1
 
-    for entry_type, name, size, content_hash in sorted(
+    sorted_entries = sorted(
         entries, key=lambda item: (item[0] != "folder", item[1].casefold())
-    ):
+    )
+    if args.yaml:
+        print(
+            yaml.dump(
+                [
+                    {
+                        "type": entry_type,
+                        "name": QuotedString(name),
+                        "size": size,
+                        "content_hash": content_hash,
+                    }
+                    for entry_type, name, size, content_hash in sorted_entries
+                ],
+                Dumper=QuotedSafeDumper,
+                sort_keys=False,
+                default_flow_style=False,
+            ),
+            end="",
+        )
+        return 0
+
+    for entry_type, name, size, content_hash in sorted_entries:
         columns = [entry_type, name]
         if args.show_size:
             columns.append(
