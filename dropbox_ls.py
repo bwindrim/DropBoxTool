@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from fnmatch import fnmatchcase
+from glob import has_magic
 import os
 import sys
 from typing import Any
 from collections.abc import Sequence
 
 import dropbox
+from requests.exceptions import RequestException
 import yaml
 from dropbox.exceptions import AuthError, DropboxException
 from dropbox.files import FolderMetadata
@@ -84,6 +87,13 @@ def normalize_dropbox_path(path: str) -> str:
     return f"/{path}"
 
 
+def positive_float(value: str) -> float:
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("must be greater than zero")
+    return timeout
+
+
 def entry_metadata(entry: Any, entry_type: str) -> dict[str, Any]:
     fields = COMMON_METADATA_FIELDS + (
         FILE_METADATA_FIELDS if entry_type == "file" else FOLDER_METADATA_FIELDS
@@ -142,6 +152,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Output structured YAML metadata instead of tab-separated text.",
     )
     parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Network timeout for each Dropbox request (default: 30).",
+    )
+    parser.add_argument(
         "paths",
         nargs="*",
         metavar="PATH",
@@ -153,6 +170,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def list_top_level(
     access_token: str,
     paths: Sequence[str] = (),
+    timeout: float = 30.0,
 ) -> list[tuple[str, str, int | None, str | None, dict[str, Any]]]:
     """Return type, display fields, and complete metadata for requested entries.
 
@@ -160,12 +178,17 @@ def list_top_level(
     files_get_metadata reads metadata for each specified file or folder. Both
     calls are read-only and require the files.metadata.read scope.
     """
-    client = dropbox.Dropbox(oauth2_access_token=access_token)
+    client = dropbox.Dropbox(oauth2_access_token=access_token, timeout=timeout)
 
     entries: list[tuple[str, str, int | None, str | None, dict[str, Any]]] = []
+    seen_entries: set[str] = set()
 
     def add_entry(entry: Any) -> None:
         entry_type = "folder" if isinstance(entry, FolderMetadata) else "file"
+        entry_key = getattr(entry, "id", None) or getattr(entry, "path_display", None) or entry.name
+        if entry_key in seen_entries:
+            return
+        seen_entries.add(entry_key)
         entries.append(
             (
                 entry_type,
@@ -177,13 +200,37 @@ def list_top_level(
         )
 
     if paths:
+        wildcard_paths = [path for path in paths if has_magic(path)]
+
         for path in paths:
-            add_entry(
-                client.files_get_metadata(
-                    normalize_dropbox_path(path),
+            if not has_magic(path):
+                add_entry(
+                    client.files_get_metadata(
+                        normalize_dropbox_path(path),
+                        include_has_explicit_shared_members=True,
+                    )
+                )
+
+        if wildcard_paths:
+            for pattern in wildcard_paths:
+                normalized_pattern = normalize_dropbox_path(pattern)
+                parent_path, name_pattern = normalized_pattern.rsplit("/", 1)
+                if has_magic(parent_path):
+                    raise ValueError(
+                        f"wildcards are supported only in the final path component: {pattern}"
+                    )
+                result = client.files_list_folder(
+                    parent_path,
+                    recursive=False,
                     include_has_explicit_shared_members=True,
                 )
-            )
+                while True:
+                    for entry in result.entries:
+                        if fnmatchcase(entry.name, name_pattern):
+                            add_entry(entry)
+                    if not result.has_more:
+                        break
+                    result = client.files_list_folder_continue(result.cursor)
         return entries
 
     result = client.files_list_folder("", include_has_explicit_shared_members=True)
@@ -206,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        entries = list_top_level(args.access_token, args.paths)
+        entries = list_top_level(args.access_token, args.paths, args.timeout)
     except AuthError:
         print(
             "Error: Dropbox rejected the token. Check that it is valid and has "
@@ -216,6 +263,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except DropboxException as exc:
         print(f"Error communicating with Dropbox: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except RequestException as exc:
+        print(f"Network error communicating with Dropbox: {exc}", file=sys.stderr)
         return 1
 
     sorted_entries = sorted(entries, key=lambda item: (item[0] != "folder", item[1].casefold()))

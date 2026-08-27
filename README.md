@@ -53,8 +53,23 @@ python3 dropbox_ls.py /Documents /Photos/photo.jpg --yaml
 Each supplied path is queried with a read-only metadata request. Ordinary paths
 may be written with or without a leading `/`; the program adds it when needed.
 Dropbox identifiers using `id:`, `rev:`, or `ns:` are passed through unchanged.
+Shell-style wildcards are supported within one folder level; quote wildcard
+arguments so the local shell does not expand them first:
+
+```sh
+python3 dropbox_ls.py '/Videos/*.mp4' '/Reports/**' --yaml
+```
+
+Wildcard matches are found by listing only the pattern's immediate parent
+folder with a read-only request, and duplicate matches are emitted only once.
+Wildcards are supported only in the final path component; for example,
+`/Reports/**` matches entries directly inside `/Reports`, but does not descend
+into nested folders.
 If no paths are supplied, the program lists the complete top-level contents as
 before.
+
+Each Dropbox request has a 30-second network timeout by default. Change it with
+`--timeout`, for example `--timeout 10`.
 
 This outputs a YAML list with commonly-used Dropbox metadata. Shared fields
 include `id`, `name`, `path_lower`, `path_display`,
