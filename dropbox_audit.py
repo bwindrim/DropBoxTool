@@ -148,12 +148,24 @@ def remote_scan(db, scan, client, root, fresh=False):
         while True:
             for item in result.entries:
                 display = item.path_display
-                prefix = root.rstrip('/')
-                if prefix and not display.casefold().startswith(prefix.casefold() + '/'):
-                    raise ValueError('Dropbox returned a path outside the configured root')
-                path = display[len(prefix):].lstrip('/')
-                if not path:
-                    continue
+                if not isinstance(display, str) or not display.startswith('/'):
+                    raise ValueError('Dropbox returned metadata without an absolute display path')
+                # Compare components, not string offsets: Unicode normalization and
+                # case folding can change the length of a root's spelling.
+                parts = display[1:].split('/')
+                prefix = root.strip('/').split('/') if root.strip('/') else []
+                if (any(part in ('', '.', '..') for part in parts)
+                        or len(parts) < len(prefix)
+                        or [normalized(p) for p in parts[:len(prefix)]] != [normalized(p) for p in prefix]):
+                    raise ValueError(f'Dropbox returned a path outside the configured root: {display!r} (root {root!r})')
+                relative = parts[len(prefix):]
+                if not relative:
+                    # A listing may include metadata for the selected folder itself.
+                    # It is not a descendant, and must not enter the relative catalogue.
+                    if isinstance(item, FolderMetadata):
+                        continue
+                    raise ValueError(f'Dropbox returned non-folder metadata for the configured root: {display!r}')
+                path = '/'.join(relative)
                 if isinstance(item, (DeletedMetadata, FileMetadata)):
                     # Prefix comparison avoids SQL LIKE wildcard interpretation of filenames.
                     db.execute("DELETE FROM entries WHERE scan=? AND side='remote' AND (norm=? OR substr(norm,1,?)=?)", (scan, normalized(path), len(normalized(path)) + 1, normalized(path) + '/'))

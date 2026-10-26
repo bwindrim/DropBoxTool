@@ -190,6 +190,33 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM scans WHERE id=3').fetchone()[0], 'incomplete')
             db.close()
 
+    def test_remote_root_metadata_on_later_page(self):
+        client = Mock()
+        client.files_list_folder.return_value = self.page([self.file('/Photos/a')], 'p1', True)
+        client.files_list_folder_continue.side_effect = [
+            self.page([self.file('/Photos/b')], 'p2', True),
+            self.page([FolderMetadata(name='Photos', id='id:root', path_display='/photos'), self.file('/Photos/c')], 'p3'),
+        ]
+        audit.remote_scan(self.db, 1, client, '/Photos')
+        self.assertEqual([r[0] for r in self.db.execute('SELECT path FROM entries ORDER BY path')], ['a', 'b', 'c'])
+        self.assertEqual(audit.setting(self.db, 'cursor'), 'p3')
+
+    def test_remote_path_validation_and_unicode_root(self):
+        client = Mock()
+        client.files_list_folder.return_value = self.page([self.file('/Cafe\u0301/a')], 'ok')
+        audit.remote_scan(self.db, 1, client, '/Caf\u00e9')
+        self.assertEqual(self.db.execute('SELECT path FROM entries WHERE scan=1').fetchone()[0], 'a')
+        for path in ('/PhotosOther/a', '/Elsewhere/a', '/Photos/../a'):
+            client.files_list_folder.return_value = self.page([self.file(path)], 'bad')
+            with self.assertRaisesRegex(ValueError, 'outside the configured root') as caught:
+                audit.remote_scan(self.db, 2, client, '/Photos', fresh=True)
+            self.assertIn(repr(path), str(caught.exception))
+            self.assertEqual(audit.setting(self.db, 'cursor'), 'ok')
+            self.assertEqual(self.db.execute('SELECT count(*) FROM entries WHERE scan=2').fetchone()[0], 0)
+        client.files_list_folder.return_value = self.page([DeletedMetadata(name='Photos', path_display='/Photos')], 'deleted')
+        with self.assertRaisesRegex(ValueError, 'non-folder metadata'):
+            audit.remote_scan(self.db, 2, client, '/Photos', fresh=True)
+
     def test_remote_move_id_history(self):
         client = Mock()
         original = self.file('/base/a')
