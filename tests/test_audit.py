@@ -1,0 +1,145 @@
+import hashlib
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
+
+import dropbox_audit as audit
+from dropbox.files import FileMetadata, FolderMetadata, DeletedMetadata
+
+
+class AuditTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'backup'
+        self.root.mkdir()
+        self.db = audit.connect(Path(self.temp.name) / 'catalogue.db')
+        self.addCleanup(self.db.close)
+
+    def test_hash_boundaries(self):
+        for length in (0, 1, audit.BLOCK - 1, audit.BLOCK, audit.BLOCK + 1, 2 * audit.BLOCK):
+            data = b'x' * length
+            path = self.root / 'file'
+            path.write_bytes(data)
+            expected = hashlib.sha256(b''.join(hashlib.sha256(data[i:i + audit.BLOCK]).digest() for i in range(0, length, audit.BLOCK))).hexdigest()
+            self.assertEqual(audit.content_hash(path)[0], expected)
+
+    def test_changing_file(self):
+        path = self.root / 'file'
+        path.write_bytes(b'hello')
+        real_stat = os.stat
+        def changed(*args, **kwargs):
+            path.write_bytes(b'changed')
+            return real_stat(*args, **kwargs)
+        with patch.object(audit.os, 'stat', side_effect=changed):
+            with self.assertRaisesRegex(OSError, 'changed'):
+                audit.content_hash(path)
+
+    def test_cache_recovery_and_full(self):
+        (self.root / 'a').write_text('a')
+        audit.local_scan(self.db, 1, self.root)
+        with patch.object(audit, 'content_hash', side_effect=AssertionError('cache not used')):
+            audit.local_scan(self.db, 2, self.root)
+        with patch.object(audit, 'content_hash', wraps=audit.content_hash) as hashed:
+            audit.local_scan(self.db, 3, self.root, full=True)
+            self.assertEqual(hashed.call_count, 1)
+
+    def test_symlink_and_unreadable(self):
+        (self.root / 'link').symlink_to('/etc/passwd')
+        self.assertEqual(audit.local_scan(self.db, 1, self.root), 1)
+        with patch.object(audit.os, 'fwalk', side_effect=lambda *a, **k: (k['onerror'](PermissionError('denied')) or iter(()))):
+            self.assertEqual(audit.local_scan(self.db, 2, self.root), 1)
+
+    def populate(self, side, path, digest='abc', kind='file', scan=1):
+        audit.entry(self.db, scan, side, path, kind, size=3, hash=digest if kind == 'file' else None)
+
+    def test_comparison(self):
+        for side in ('local', 'remote'):
+            self.populate(side, 'same')
+        self.populate('local', 'missing')
+        self.populate('remote', 'extra', 'other')
+        self.populate('local', 'modified', 'old')
+        self.populate('remote', 'modified', 'new')
+        self.populate('remote', 'renamed')
+        self.populate('local', 'empty', kind='folder')
+        self.assertEqual(audit.compare(self.db, 1), 1)
+        categories = {r[0] for r in self.db.execute('SELECT category FROM issues')}
+        self.assertTrue({'missing_remotely', 'extra_remotely', 'content_mismatch', 'possible_rename', 'directory_mismatch'} <= categories)
+
+    def test_collision(self):
+        self.populate('local', 'A')
+        self.populate('local', 'a')
+        audit.compare(self.db, 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE category='path_collision'").fetchone()[0], 2)
+
+    def test_historical_and_baseline(self):
+        self.populate('local', 'gone')
+        audit.compare(self.db, 1)
+        self.populate('local', 'gone', scan=2)
+        audit.compare(self.db, 2)
+        self.assertEqual(self.db.execute("SELECT is_new FROM issues WHERE scan=2 AND category='missing_remotely'").fetchone()[0], 0)
+        audit.compare(self.db, 3)
+        self.assertEqual(self.db.execute("SELECT category FROM issues WHERE scan=3").fetchone()[0], 'local_baseline_changed')
+
+    def file(self, path):
+        return FileMetadata(name=path.split('/')[-1], id='id:' + path, client_modified=__import__('datetime').datetime(2020, 1, 1), server_modified=__import__('datetime').datetime(2020, 1, 1), rev='123456789', size=1, path_display=path, content_hash='a' * 64)
+
+    def page(self, entries, cursor, more=False):
+        return SimpleNamespace(entries=entries, cursor=cursor, has_more=more)
+
+    def test_pagination_failure_atomicity_and_deletion(self):
+        client = Mock()
+        client.files_list_folder.return_value = self.page([FolderMetadata(name='dir', id='id:dir', path_display='/base/dir'), self.file('/base/dir/a')], 'p1', True)
+        client.files_list_folder_continue.return_value = self.page([self.file('/base/b')], 'p2')
+        audit.remote_scan(self.db, 1, client, '/base')
+        self.assertEqual(audit.setting(self.db, 'cursor'), 'p2')
+        client.files_list_folder_continue.side_effect = [self.page([DeletedMetadata(name='dir', path_display='/base/dir')], 'p3', True), RuntimeError('offline')]
+        with self.assertRaises(RuntimeError):
+            audit.remote_scan(self.db, 2, client, '/base')
+        self.assertEqual(audit.setting(self.db, 'cursor'), 'p2')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM entries WHERE scan=2').fetchone()[0], 0)
+        client.files_list_folder_continue.side_effect = None
+        client.files_list_folder_continue.return_value = self.page([DeletedMetadata(name='dir', path_display='/base/dir')], 'p4')
+        audit.remote_scan(self.db, 3, client, '/base')
+        self.assertEqual([r[0] for r in self.db.execute('SELECT path FROM entries WHERE scan=3')], ['b'])
+
+    def test_cli_end_to_end_and_history(self):
+        import contextlib
+        import io
+        database = str(Path(self.temp.name) / 'cli.db')
+        (self.root / 'a').write_bytes(b'x')
+        metadata = self.file('/base/a')
+        metadata.content_hash = audit.content_hash(self.root / 'a')[0]
+        client = Mock()
+        client.files_list_folder.return_value = self.page([metadata], 'c1')
+        client.files_list_folder_continue.return_value = self.page([], 'c2')
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(os.environ, {'DROPBOX_ACCESS_TOKEN': 'fake'}), patch('dropbox.Dropbox', return_value=client):
+            self.assertEqual(audit.main(['--db', database, 'init', '--local-root', str(self.root), '--dropbox-root', '/base']), 0)
+            self.assertEqual(audit.main(['--db', database, 'initial']), 0)
+            self.assertEqual(audit.main(['--db', database, 'quick']), 0)
+            self.assertEqual(audit.main(['--db', database, 'report']), 0)
+            (self.root / 'a').write_bytes(b'changed')
+            self.assertEqual(audit.main(['--db', database, 'quick']), 1)
+
+    def test_remote_move_id_history(self):
+        client = Mock()
+        original = self.file('/base/a')
+        client.files_list_folder.return_value = self.page([original], 'c1')
+        audit.remote_scan(self.db, 1, client, '/base')
+        moved = self.file('/base/b')
+        moved.id = original.id
+        client.files_list_folder_continue.return_value = self.page([DeletedMetadata(name='a', path_display='/base/a'), moved], 'c2')
+        audit.remote_scan(self.db, 2, client, '/base')
+        event = self.db.execute('SELECT old_path,new_path,event FROM remote_events').fetchone()
+        self.assertEqual(tuple(event), ('a', 'b', 'moved'))
+
+    def test_safe_output(self):
+        with self.assertRaises(ValueError):
+            audit.safe_output(self.root / 'db', self.root, Path('/other'))
+
+
+if __name__ == '__main__':
+    unittest.main()
