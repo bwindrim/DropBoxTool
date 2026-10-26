@@ -50,6 +50,7 @@ def connect(path):
     CREATE TABLE IF NOT EXISTS entries(scan INTEGER,side TEXT,path TEXT,kind TEXT,size INTEGER,mtime TEXT,hash TEXT,file_id TEXT,verified REAL,error TEXT,norm TEXT,PRIMARY KEY(scan,side,path));
     CREATE INDEX IF NOT EXISTS entry_hash ON entries(scan,side,hash);
     CREATE INDEX IF NOT EXISTS entry_norm ON entries(scan,side,norm);
+    CREATE TABLE IF NOT EXISTS comparison_sources(scan INTEGER PRIMARY KEY,local_scan INTEGER NOT NULL,remote_scan INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS remote_events(scan INTEGER,file_id TEXT,old_path TEXT,new_path TEXT,event TEXT);
     CREATE TABLE IF NOT EXISTS cache(path TEXT PRIMARY KEY,size INTEGER,mtime TEXT,hash TEXT,verified REAL);
     CREATE TABLE IF NOT EXISTS issues(scan INTEGER,category TEXT,path TEXT,other TEXT,detail TEXT,is_new INTEGER);
@@ -192,7 +193,7 @@ def remote_scan(db, scan, client, root, fresh=False):
         put(db, 'remote_scan', scan)
 
 
-def compare(db, scan):
+def compare(db, scan, *, commit=True):
     previous = setting(db, 'comparison_scan', '0')
     def issue(category, path, other='', detail=''):
         exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
@@ -226,7 +227,8 @@ def compare(db, scan):
     baseline_changes(db, scan, issue)
     put(db, 'comparison_scan', scan)
     put(db, 'identical', identical)
-    db.commit()
+    if commit:
+        db.commit()
     return identical
 
 
@@ -239,6 +241,28 @@ def baseline_changes(db, scan, issue):
                 issue('local_baseline_changed', old['path'], detail='removed' if now is None else 'modified or unverified')
     else:
         put(db, 'baseline_scan', scan)
+
+
+def offline_compare(db):
+    """Compare saved snapshots atomically, without consulting either directory tree."""
+    local = db.execute("SELECT id FROM scans WHERE status='complete' AND mode IN ('local','initial','quick','full') ORDER BY id DESC LIMIT 1").fetchone()
+    remote = setting(db, 'remote_scan')
+    if local is None:
+        raise ValueError('No completed local catalogue available; run local first')
+    if remote is None or db.execute('SELECT 1 FROM scans WHERE id=?', (remote,)).fetchone() is None:
+        raise ValueError('No trusted remote catalogue available; run initial or quick first')
+    local_id, remote_id = local[0], int(remote)
+    # Copies preserve historical report behavior and use SQLite disk-backed storage.
+    # Include empty successful catalogues: entry counts do not indicate completeness.
+    with db:
+        scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', ('compare', time.time(), 'running')).lastrowid
+        for side, source in (('local', local_id), ('remote', remote_id)):
+            db.execute('INSERT INTO entries SELECT ?,side,path,kind,size,mtime,hash,file_id,verified,error,norm FROM entries WHERE scan=? AND side=?', (scan, source, side))
+        db.execute('INSERT INTO comparison_sources VALUES (?,?,?)', (scan, local_id, remote_id))
+        compare(db, scan, commit=False)
+        incomplete = db.execute("SELECT 1 FROM issues WHERE scan=? AND category='unverified'", (scan,)).fetchone()
+        db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if incomplete else 'complete', scan))
+    return scan
 
 
 def safe_output(path, root, database):
@@ -257,6 +281,13 @@ def report(db, scan, csv_path=None, json_path=None):
     summary['identical'] = db.execute("SELECT count(*) FROM entries l JOIN entries r ON l.scan=r.scan AND l.path=r.path WHERE l.scan=? AND l.side='local' AND r.side='remote' AND l.kind='file' AND l.hash=r.hash AND l.error IS NULL AND r.error IS NULL", (scan,)).fetchone()[0]
     row = db.execute('SELECT * FROM scans WHERE id=?', (scan,)).fetchone()
     summary['scan'] = dict(row)
+    sources = db.execute('SELECT local_scan,remote_scan FROM comparison_sources WHERE scan=?', (scan,)).fetchone()
+    if sources:
+        summary['sources'] = {
+            side: dict(db.execute('SELECT id,mode,started,finished,status FROM scans WHERE id=?', (sources[side + '_scan'],)).fetchone())
+            for side in ('local', 'remote')
+        }
+        summary['remote_state_note'] = 'Saved Dropbox metadata only; Dropbox has not been contacted.'
     summary['comparison_performed'] = row['mode'] != 'local'
     if row['mode'] == 'local':
         summary['remote'] = None
@@ -287,7 +318,7 @@ def main(argv=None):
     init = sub.add_parser('init')
     init.add_argument('--local-root', required=True, type=Path)
     init.add_argument('--dropbox-root', required=True)
-    for name in ('initial', 'quick', 'full', 'local', 'report'):
+    for name in ('initial', 'quick', 'full', 'local', 'compare', 'report'):
         command = sub.add_parser(name)
         command.add_argument('--csv')
         command.add_argument('--json')
@@ -295,7 +326,7 @@ def main(argv=None):
             command.add_argument('--scan', type=int, help='Include failed scan diagnostics by scan ID')
         if name == 'local':
             command.add_argument('--full', action='store_true', help='Rehash every local file')
-        if name not in ('local', 'report'):
+        if name not in ('local', 'compare', 'report'):
             command.add_argument('--rebuild-remote', action='store_true')
     sub.add_parser('history')
     args = parser.parse_args(argv)
@@ -349,6 +380,11 @@ def main(argv=None):
             for error in db.execute('SELECT side,path,error FROM entries WHERE scan=? AND error IS NOT NULL', (scan_id,)):
                 print(json.dumps(dict(error)))
             return 2 if status[0] != 'complete' else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan_id,)).fetchone() is not None)
+        if args.command == 'compare':
+            scan = offline_compare(db)
+            report(db, scan, csv_path, json_path)
+            status = db.execute('SELECT status FROM scans WHERE id=?', (scan,)).fetchone()[0]
+            return 2 if status != 'complete' else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan,)).fetchone() is not None)
         s = root.stat()
         if f'{s.st_dev}:{s.st_ino}' != setting(db, 'root_identity'):
             raise ValueError('Local root identity changed; check that the correct disk is mounted')

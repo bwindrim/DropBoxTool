@@ -217,6 +217,75 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'non-folder metadata'):
             audit.remote_scan(self.db, 2, client, '/Photos', fresh=True)
 
+    def test_offline_compare_latest_local_and_saved_remote(self):
+        import contextlib
+        import io
+        import json
+        database = str(Path(self.temp.name) / 'offline.db')
+        (self.root / 'a').write_bytes(b'x')
+        metadata = self.file('/base/a')
+        metadata.content_hash = audit.content_hash(self.root / 'a')[0]
+        client = Mock()
+        client.files_list_folder.return_value = self.page([metadata], 'trusted-cursor')
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(os.environ, {'DROPBOX_ACCESS_TOKEN': 'fake'}), patch('dropbox.Dropbox', return_value=client):
+            self.assertEqual(audit.main(['--db', database, 'init', '--local-root', str(self.root), '--dropbox-root', '/base']), 0)
+            self.assertEqual(audit.main(['--db', database, 'initial']), 0)
+            (self.root / 'a').write_bytes(b'changed')
+            self.assertEqual(audit.main(['--db', database, 'local']), 1)
+        # Simulate a disconnected backup disk. Offline comparison must still work.
+        self.root.rename(Path(self.temp.name) / 'unmounted')
+        json_path = str(Path(self.temp.name) / 'offline.json')
+        csv_path = str(Path(self.temp.name) / 'offline.csv')
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(os.environ, {}, clear=True), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')), patch.object(audit, 'local_scan', side_effect=AssertionError('local scanned')), patch.object(audit, 'remote_scan', side_effect=AssertionError('remote scanned')):
+            self.assertEqual(audit.main(['--db', database, 'compare', '--json', json_path, '--csv', csv_path]), 1)
+            self.assertEqual(audit.main(['--db', database, 'compare']), 1)
+            self.assertEqual(audit.main(['--db', database, 'report']), 1)
+        saved = json.loads(Path(json_path).read_text())
+        self.assertEqual(saved['summary']['sources']['local']['id'], 2)
+        self.assertEqual(saved['summary']['sources']['remote']['id'], 1)
+        self.assertEqual(saved['summary']['discrepancies']['content_mismatch'], 1)
+        self.assertIn('content_mismatch', Path(csv_path).read_text())
+        db = audit.connect(database)
+        self.addCleanup(db.close)
+        self.assertEqual(audit.setting(db, 'cursor'), 'trusted-cursor')
+        self.assertEqual(audit.setting(db, 'remote_scan'), '1')
+        self.assertEqual(audit.setting(db, 'baseline_scan'), '1')
+        self.assertEqual(audit.setting(db, 'local_scan'), '2')
+        self.assertEqual(db.execute("SELECT is_new FROM issues WHERE scan=4 AND category='content_mismatch'").fetchone()[0], 0)
+
+    def test_offline_compare_missing_and_empty_catalogues(self):
+        with self.assertRaisesRegex(ValueError, 'local catalogue'):
+            audit.offline_compare(self.db)
+        self.db.execute("INSERT INTO scans VALUES (1,'local',1,2,'complete',NULL)")
+        with self.assertRaisesRegex(ValueError, 'remote catalogue'):
+            audit.offline_compare(self.db)
+        self.db.execute("INSERT INTO scans VALUES (2,'initial',2,3,'complete',NULL)")
+        audit.put(self.db, 'remote_scan', 2)
+        # Newer incomplete local data must not be used.
+        self.db.execute("INSERT INTO scans VALUES (3,'local',3,4,'incomplete',NULL)")
+        self.populate('local', 'partial', scan=3)
+        self.db.commit()
+        scan = audit.offline_compare(self.db)
+        self.assertEqual(tuple(self.db.execute('SELECT local_scan,remote_scan FROM comparison_sources WHERE scan=?', (scan,)).fetchone()), (2, 2))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM issues WHERE scan=?', (scan,)).fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT status FROM scans WHERE id=?', (scan,)).fetchone()[0], 'complete')
+
+    def test_offline_compare_atomicity_and_unverified_remote(self):
+        self.db.execute("INSERT INTO scans VALUES (1,'initial',1,2,'incomplete',NULL)")
+        self.db.execute("INSERT INTO scans VALUES (2,'local',2,3,'complete',NULL)")
+        self.populate('local', 'a', scan=2)
+        audit.entry(self.db, 1, 'remote', 'a', 'file', size=3, error='no hash')
+        audit.put(self.db, 'remote_scan', 1)
+        self.db.commit()
+        with patch.object(audit, 'compare', side_effect=RuntimeError('interrupted')):
+            with self.assertRaises(RuntimeError):
+                audit.offline_compare(self.db)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM scans').fetchone()[0], 2)
+        self.assertIsNone(audit.setting(self.db, 'comparison_scan'))
+        scan = audit.offline_compare(self.db)
+        self.assertEqual(self.db.execute('SELECT status FROM scans WHERE id=?', (scan,)).fetchone()[0], 'incomplete')
+        self.assertEqual(self.db.execute('SELECT category FROM issues WHERE scan=?', (scan,)).fetchone()[0], 'unverified')
+
     def test_remote_move_id_history(self):
         client = Mock()
         original = self.file('/base/a')

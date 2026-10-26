@@ -177,6 +177,30 @@ back to the latest successful local scan if no Dropbox comparison exists.
 Afterward, set your Dropbox credentials and run `initial` to perform the first
 remote comparison, reusing the local hash cache while preserving the baseline.
 
+To compare saved catalogues again without rescanning either tree:
+
+```sh
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" compare
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" compare --csv "$HOME/offline-comparison.csv"
+```
+
+`compare` selects the latest completed local scan (`local`, `initial`, `quick`,
+or `full`) and the last trusted remote snapshot in the same database. It requires
+no Dropbox credentials or mounted backup disk. Incomplete local scans and previous
+offline comparisons are excluded when selecting the local source. A missing
+catalogue produces exit 2; an empty but completed catalogue is valid. Remote
+metadata with unverifiable files remains unverified and produces exit 2.
+
+This compares Dropbox's **saved state**, not its current live state. Terminal and
+JSON summaries include source scan IDs, timestamps and a saved-state reminder.
+Each comparison is saved atomically as a new history record with its own metadata
+copies and discrepancies; `report` then displays that comparison. Exit codes are
+0 for a match, 1 for discrepancies and 2 for incomplete/operational errors.
+Repeated comparisons mark continuing discrepancies as previously recorded.
+Existing baseline, hash cache, local snapshot pointer, remote snapshot pointer
+and Dropbox cursor are preserved. Comparison snapshots add SQLite disk usage
+proportional to the saved entries. Use `quick` when you want fresh Dropbox state.
+
 `initial` builds the baseline if needed, `quick` reuses hashes for unchanged size and
 nanosecond mtime, and `full` hashes everything and lists Dropbox afresh.
 Quick mode can miss edits that preserve both metadata values; use full regularly.
@@ -190,7 +214,8 @@ printing SDK request details. Fix credentials in the environment and retry.
 SQLite stores `config` (roots, baseline/snapshot pointers and cursor, no tokens),
 `scans` (completion/history), `entries` (per-scan local/remote metadata and errors),
 `cache` (restartable hashes), `issues` (historical discrepancies), and
-`remote_events` (removed, modified or moved paths linked by Dropbox ID).
+`remote_events` (removed, modified or moved paths linked by Dropbox ID), and
+`comparison_sources` (source scan IDs for offline comparisons).
 Entries are indexed by exact path, content hash and a case-folded NFC key.
 All snapshots and discrepancies are retained; disk usage grows with scan history.
 Inspect `remote_events` with SQLite to investigate ID-confirmed moves. The first
