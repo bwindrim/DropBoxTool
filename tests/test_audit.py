@@ -286,6 +286,60 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT status FROM scans WHERE id=?', (scan,)).fetchone()[0], 'incomplete')
         self.assertEqual(self.db.execute('SELECT category FROM issues WHERE scan=?', (scan,)).fetchone()[0], 'unverified')
 
+    def test_ignore_hidden_files_preserves_directories_and_cache(self):
+        (self.root / '.hidden-dir').mkdir()
+        (self.root / '.hidden-dir' / 'visible').write_text('keep')
+        (self.root / '.hidden-dir' / '.hidden').write_text('skip')
+        (self.root / '.dotfile').write_text('skip')
+        (self.root / 'visible').write_text('keep')
+        audit.local_scan(self.db, 1, self.root)
+        audit.put(self.db, 'baseline_scan', 1)
+        self.db.commit()
+        with patch.object(audit, 'content_hash', side_effect=AssertionError('cache should be reused')):
+            self.assertEqual(audit.local_scan(self.db, 2, self.root, ignore_hidden=True), 0)
+        paths = {row[0] for row in self.db.execute('SELECT path FROM entries WHERE scan=2')}
+        self.assertEqual(paths, {'.hidden-dir', '.hidden-dir/visible', 'visible'})
+        issues = []
+        audit.baseline_changes(self.db, 2, lambda *args, **kwargs: issues.append((args, kwargs)))
+        self.assertEqual(issues, [])
+        self.assertTrue(audit.ignores_hidden(self.db, 2))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM cache').fetchone()[0], 4)
+        # Removing an actual hidden directory is still a baseline change.
+        self.db.execute("DELETE FROM entries WHERE scan=2 AND path='.hidden-dir'")
+        audit.baseline_changes(self.db, 2, lambda *args, **kwargs: issues.append((args, kwargs)))
+        self.assertEqual(issues[0][0], ('local_baseline_changed', '.hidden-dir'))
+
+    def test_ignore_hidden_cli_and_offline_compare(self):
+        import contextlib
+        import io
+        import json
+        database = str(Path(self.temp.name) / 'hidden.db')
+        (self.root / '.dotfile').write_text('skip')
+        (self.root / 'visible').write_text('keep')
+        with contextlib.redirect_stdout(io.StringIO()), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')):
+            self.assertEqual(audit.main(['--db', database, 'init', '--local-root', str(self.root), '--dropbox-root', '/base']), 0)
+            self.assertEqual(audit.main(['--db', database, 'local']), 0)
+            self.assertEqual(audit.main(['--db', database, 'local', '--ignore-hidden']), 0)
+        db = audit.connect(database)
+        self.addCleanup(db.close)
+        db.execute("INSERT INTO scans VALUES (3,'initial',1,2,'complete',NULL)")
+        # Emulate an older trusted remote snapshot with just the visible file.
+        db.execute("INSERT INTO entries SELECT 3,'remote',path,kind,size,mtime,hash,file_id,verified,error,norm FROM entries WHERE scan=2 AND path='visible'")
+        db.execute("UPDATE scans SET status='incomplete' WHERE id=3")
+        audit.put(db, 'remote_scan', 3)
+        db.commit()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')):
+            self.assertEqual(audit.main(['--db', database, 'compare']), 0)
+        self.assertTrue(json.loads(output.getvalue())['ignore_hidden_local_files'])
+        self.assertTrue(audit.ignores_hidden(db, 4))
+        self.assertEqual(db.execute("SELECT count(*) FROM issues WHERE scan=4").fetchone()[0], 0)
+        # The default remains inclusive on subsequent scans.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(audit.main(['--db', database, 'local']), 0)
+        self.assertFalse(audit.ignores_hidden(db, 5))
+        self.assertIsNotNone(db.execute("SELECT 1 FROM entries WHERE scan=5 AND path='.dotfile'").fetchone())
+
     def test_remote_move_id_history(self):
         client = Mock()
         original = self.file('/base/a')
@@ -297,6 +351,50 @@ class AuditTests(unittest.TestCase):
         audit.remote_scan(self.db, 2, client, '/base')
         event = self.db.execute('SELECT old_path,new_path,event FROM remote_events').fetchone()
         self.assertEqual(tuple(event), ('a', 'b', 'moved'))
+
+    def test_csv_filters_are_independent_and_do_not_change_results(self):
+        import contextlib
+        import csv
+        import io
+        import json
+        import itertools
+        audit.put(self.db, 'local_root', self.root)
+        self.db.execute("INSERT INTO scans VALUES (1,'local',1,2,'complete',NULL)")
+        self.db.execute("INSERT INTO scans VALUES (2,'compare',2,3,'complete',NULL)")
+        self.populate('local', 'removed', scan=1)
+        audit.put(self.db, 'baseline_scan', 1)
+        self.populate('local', 'missing', scan=2)
+        self.populate('remote', 'extra', scan=2)
+        self.populate('remote', 'extra-dir', kind='folder', scan=2)
+        audit.entry(self.db, 2, 'remote', 'remote-unverified', 'file', error='no hash')
+        self.populate('local', 'missing-dir', kind='folder', scan=2)
+        self.populate('local', 'type-diff', kind='folder', scan=2)
+        self.populate('remote', 'type-diff', scan=2)
+        audit.compare(self.db, 2)
+        original_count = self.db.execute('SELECT count(*) FROM issues WHERE scan=2').fetchone()[0]
+        database = str(Path(self.temp.name) / 'catalogue.db')
+        for omit_remote, omit_baseline in itertools.product((False, True), repeat=2):
+            tag = f'{omit_remote}-{omit_baseline}'
+            csv_path = Path(self.temp.name) / (tag + '.csv')
+            json_path = Path(self.temp.name) / (tag + '.json')
+            args = ['--db', database, 'report', '--scan', '2', '--csv', str(csv_path), '--json', str(json_path)]
+            if omit_remote:
+                args.append('--csv-omit-remote-only')
+            if omit_baseline:
+                args.append('--csv-omit-baseline-changes')
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(audit, 'local_scan', side_effect=AssertionError('scan called')):
+                self.assertEqual(audit.main(args), 1)
+            with csv_path.open(newline='') as source:
+                rows = list(csv.DictReader(source))
+            paths = {row['path'] for row in rows}
+            for path in ('extra', 'extra-dir', 'remote-unverified'):
+                self.assertEqual(path in paths, not omit_remote)
+            self.assertEqual('removed' in paths, not omit_baseline)
+            self.assertTrue({'missing', 'missing-dir', 'type-diff'} <= paths)
+            saved = json.loads(json_path.read_text())
+            self.assertEqual(len(saved['issues']), original_count)
+            self.assertEqual(saved['summary']['discrepancies']['extra_remotely'], 1)
+            self.assertEqual(self.db.execute('SELECT count(*) FROM issues WHERE scan=2').fetchone()[0], original_count)
 
     def test_safe_output(self):
         with self.assertRaises(ValueError):

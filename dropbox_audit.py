@@ -50,6 +50,7 @@ def connect(path):
     CREATE TABLE IF NOT EXISTS entries(scan INTEGER,side TEXT,path TEXT,kind TEXT,size INTEGER,mtime TEXT,hash TEXT,file_id TEXT,verified REAL,error TEXT,norm TEXT,PRIMARY KEY(scan,side,path));
     CREATE INDEX IF NOT EXISTS entry_hash ON entries(scan,side,hash);
     CREATE INDEX IF NOT EXISTS entry_norm ON entries(scan,side,norm);
+    CREATE TABLE IF NOT EXISTS scan_options(scan INTEGER PRIMARY KEY,ignore_hidden INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS comparison_sources(scan INTEGER PRIMARY KEY,local_scan INTEGER NOT NULL,remote_scan INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS remote_events(scan INTEGER,file_id TEXT,old_path TEXT,new_path TEXT,event TEXT);
     CREATE TABLE IF NOT EXISTS cache(path TEXT PRIMARY KEY,size INTEGER,mtime TEXT,hash TEXT,verified REAL);
@@ -78,7 +79,14 @@ def entry(db, scan, side, path, kind, size=None, mtime=None, hash=None,
                (scan, side, path, kind, size, mtime, hash, file_id, verified, error, normalized(path)))
 
 
-def local_scan(db, scan, root, full=False):
+def ignores_hidden(db, scan):
+    row = db.execute('SELECT ignore_hidden FROM scan_options WHERE scan=?', (scan,)).fetchone()
+    return bool(row and row[0])
+
+
+def local_scan(db, scan, root, full=False, ignore_hidden=False):
+    db.execute('INSERT OR REPLACE INTO scan_options VALUES (?,?)', (scan, int(ignore_hidden)))
+    db.commit()
     errors = 0
     def traversal_error(exc):
         nonlocal errors
@@ -90,7 +98,8 @@ def local_scan(db, scan, root, full=False):
     # fwalk pins parent directory descriptors, avoiding traversal through replaced links.
     count = 0
     for directory, directories, files, directory_fd in os.fwalk(root, follow_symlinks=False, onerror=traversal_error):
-        for name in directories + files:
+        visible_files = [name for name in files if not (ignore_hidden and name.startswith('.'))]
+        for name in directories + visible_files:
             relative = Path(directory, name).relative_to(root).as_posix()
             try:
                 s = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -234,8 +243,11 @@ def compare(db, scan, *, commit=True):
 
 def baseline_changes(db, scan, issue):
     baseline = setting(db, 'baseline_scan')
+    ignore_hidden = ignores_hidden(db, scan)
     if baseline:
         for old in db.execute("SELECT * FROM entries WHERE scan=? AND side='local'", (baseline,)):
+            if ignore_hidden and old['kind'] != 'folder' and old['path'].rsplit('/', 1)[-1].startswith('.'):
+                continue
             now = db.execute("SELECT * FROM entries WHERE scan=? AND side='local' AND path=?", (scan, old['path'])).fetchone()
             if now is None or (old['kind'], old['hash']) != (now['kind'], now['hash']):
                 issue('local_baseline_changed', old['path'], detail='removed' if now is None else 'modified or unverified')
@@ -259,6 +271,7 @@ def offline_compare(db):
         for side, source in (('local', local_id), ('remote', remote_id)):
             db.execute('INSERT INTO entries SELECT ?,side,path,kind,size,mtime,hash,file_id,verified,error,norm FROM entries WHERE scan=? AND side=?', (scan, source, side))
         db.execute('INSERT INTO comparison_sources VALUES (?,?,?)', (scan, local_id, remote_id))
+        db.execute('INSERT INTO scan_options VALUES (?,?)', (scan, int(ignores_hidden(db, local_id))))
         compare(db, scan, commit=False)
         incomplete = db.execute("SELECT 1 FROM issues WHERE scan=? AND category='unverified'", (scan,)).fetchone()
         db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if incomplete else 'complete', scan))
@@ -275,12 +288,14 @@ def safe_output(path, root, database):
     return resolved
 
 
-def report(db, scan, csv_path=None, json_path=None):
+def report(db, scan, csv_path=None, json_path=None, *,
+           csv_omit_remote_only=False, csv_omit_baseline_changes=False):
     summary = {side: dict(db.execute("SELECT count(*) AS files,coalesce(sum(size),0) AS bytes FROM entries WHERE scan=? AND side=? AND kind='file'", (scan, side)).fetchone()) for side in ('local', 'remote')}
     summary['discrepancies'] = dict(db.execute('SELECT category,count(*) FROM issues WHERE scan=? GROUP BY category', (scan,)))
     summary['identical'] = db.execute("SELECT count(*) FROM entries l JOIN entries r ON l.scan=r.scan AND l.path=r.path WHERE l.scan=? AND l.side='local' AND r.side='remote' AND l.kind='file' AND l.hash=r.hash AND l.error IS NULL AND r.error IS NULL", (scan,)).fetchone()[0]
     row = db.execute('SELECT * FROM scans WHERE id=?', (scan,)).fetchone()
     summary['scan'] = dict(row)
+    summary['ignore_hidden_local_files'] = ignores_hidden(db, scan)
     sources = db.execute('SELECT local_scan,remote_scan FROM comparison_sources WHERE scan=?', (scan,)).fetchone()
     if sources:
         summary['sources'] = {
@@ -299,7 +314,17 @@ def report(db, scan, csv_path=None, json_path=None):
         with open(csv_path, 'x', newline='', encoding='utf-8') as target:
             writer = csv.writer(target)
             writer.writerow(fields)
-            writer.writerows(db.execute('SELECT category,path,other,detail,is_new FROM issues WHERE scan=? ORDER BY category,path', (scan,)))
+            conditions = ['i.scan=?']
+            if csv_omit_remote_only:
+                conditions.append("""NOT (
+                    EXISTS (SELECT 1 FROM entries r WHERE r.scan=i.scan AND r.side='remote' AND r.path=i.path)
+                    AND NOT EXISTS (SELECT 1 FROM entries l WHERE l.scan=i.scan AND l.side='local' AND l.path=i.path)
+                )""")
+            if csv_omit_baseline_changes:
+                conditions.append("i.category<>'local_baseline_changed'")
+            query = ('SELECT i.category,i.path,i.other,i.detail,i.is_new FROM issues i WHERE '
+                     + ' AND '.join(conditions) + ' ORDER BY i.category,i.path')
+            writer.writerows(db.execute(query, (scan,)))
     if json_path:
         with open(json_path, 'x', encoding='utf-8') as target:
             target.write('{"summary":' + json.dumps(summary) + ',"issues":[')
@@ -322,14 +347,24 @@ def main(argv=None):
         command = sub.add_parser(name)
         command.add_argument('--csv')
         command.add_argument('--json')
+        command.add_argument('--csv-omit-remote-only', action='store_true',
+                             help='Omit CSV rows for paths present only in the remote catalogue')
+        command.add_argument('--csv-omit-baseline-changes', action='store_true',
+                             help='Omit local_baseline_changed rows from CSV')
         if name == 'report':
             command.add_argument('--scan', type=int, help='Include failed scan diagnostics by scan ID')
+        if name in ('local', 'initial', 'quick', 'full'):
+            command.add_argument('--ignore-hidden', action='store_true', help="Skip local files whose names begin with '.'; still traverse hidden directories")
         if name == 'local':
             command.add_argument('--full', action='store_true', help='Rehash every local file')
         if name not in ('local', 'compare', 'report'):
             command.add_argument('--rebuild-remote', action='store_true')
     sub.add_parser('history')
     args = parser.parse_args(argv)
+    csv_options = {
+        'csv_omit_remote_only': getattr(args, 'csv_omit_remote_only', False),
+        'csv_omit_baseline_changes': getattr(args, 'csv_omit_baseline_changes', False),
+    }
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
     db = None
     scan = None
@@ -376,13 +411,13 @@ def main(argv=None):
             status = db.execute('SELECT status FROM scans WHERE id=?', (scan_id,)).fetchone()
             if status is None:
                 raise ValueError('Unknown scan ID')
-            report(db, scan_id, csv_path, json_path)
+            report(db, scan_id, csv_path, json_path, **csv_options)
             for error in db.execute('SELECT side,path,error FROM entries WHERE scan=? AND error IS NOT NULL', (scan_id,)):
                 print(json.dumps(dict(error)))
             return 2 if status[0] != 'complete' else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan_id,)).fetchone() is not None)
         if args.command == 'compare':
             scan = offline_compare(db)
-            report(db, scan, csv_path, json_path)
+            report(db, scan, csv_path, json_path, **csv_options)
             status = db.execute('SELECT status FROM scans WHERE id=?', (scan,)).fetchone()[0]
             return 2 if status != 'complete' else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan,)).fetchone() is not None)
         s = root.stat()
@@ -394,7 +429,7 @@ def main(argv=None):
             db.execute("UPDATE scans SET status='interrupted',finished=? WHERE status='running'", (time.time(),))
             scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', ('local', time.time(), 'running')).lastrowid
             db.commit()
-            errors = local_scan(db, scan, root, args.full)
+            errors = local_scan(db, scan, root, args.full, ignore_hidden=args.ignore_hidden)
             previous = setting(db, 'local_scan', '0')
 
             def local_issue(category, path, other='', detail=''):
@@ -409,7 +444,7 @@ def main(argv=None):
                 put(db, 'local_scan', scan)
             db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if errors else 'complete', scan))
             db.commit()
-            report(db, scan, csv_path, json_path)
+            report(db, scan, csv_path, json_path, **csv_options)
             return 2 if errors else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan,)).fetchone() is not None)
         import dropbox
         token = os.getenv('DROPBOX_ACCESS_TOKEN')
@@ -424,7 +459,7 @@ def main(argv=None):
         db.execute("UPDATE scans SET status='interrupted',finished=? WHERE status='running'", (time.time(),))
         scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', (args.command, time.time(), 'running')).lastrowid
         db.commit()
-        errors = local_scan(db, scan, root, args.command == 'full')
+        errors = local_scan(db, scan, root, args.command == 'full', ignore_hidden=args.ignore_hidden)
         if errors:
             raise RuntimeError('Local scan incomplete; trusted comparison retained. Inspect entries.error for this scan.')
         remote_scan(db, scan, client, setting(db, 'dropbox_root'), args.command != 'quick' or args.rebuild_remote)
@@ -432,7 +467,7 @@ def main(argv=None):
         incomplete = db.execute("SELECT 1 FROM issues WHERE scan=? AND category='unverified'", (scan,)).fetchone()
         db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if incomplete else 'complete', scan))
         db.commit()
-        report(db, scan, csv_path, json_path)
+        report(db, scan, csv_path, json_path, **csv_options)
         return 2 if incomplete else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan,)).fetchone() is not None)
     except (Exception, KeyboardInterrupt) as exc:
         if db is not None and scan is not None:

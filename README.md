@@ -162,6 +162,25 @@ python3 dropbox_audit.py --db "$HOME/audit.sqlite" -v local
 python3 dropbox_audit.py --db "$HOME/audit.sqlite" -v local --full
 ```
 
+To skip local files whose final filename starts with `.`, including macOS
+AppleDouble files such as `._photo.tif`, add `--ignore-hidden`:
+
+```sh
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" -v local --ignore-hidden
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" compare
+```
+
+The flag is also available on `initial`, `quick` and `full`, and can be combined
+with `local --full`. It applies to files in every directory; directories whose
+names start with `.` are still recorded and traversed. Files are included by
+default, so pass the flag on each scan where you want filtering. Existing history
+and cached hashes are retained. Excluded files are not treated as removals from
+the local baseline. Each scan records the option, and offline `compare` inherits
+it from its local source; summaries show `ignore_hidden_local_files`.
+This filters only the local catalogue: dotfiles present in the remote catalogue
+can still be reported as `extra_remotely`. To apply filtering to saved data, run
+a new local scan with the flag before running `compare`.
+
 `local` enumerates and hashes the configured backup, reusing unchanged cached
 hashes. `--full` forces every hash to be recalculated. Rerun `local` after an
 interruption to reuse committed progress. It never loads the Dropbox SDK or
@@ -183,6 +202,23 @@ To compare saved catalogues again without rescanning either tree:
 python3 dropbox_audit.py --db "$HOME/audit.sqlite" compare
 python3 dropbox_audit.py --db "$HOME/audit.sqlite" compare --csv "$HOME/offline-comparison.csv"
 ```
+
+CSV exports can be filtered independently or together:
+
+```sh
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" report --csv "$HOME/filtered.csv" \
+  --csv-omit-remote-only --csv-omit-baseline-changes
+```
+
+`--csv-omit-remote-only` omits rows whose path exists in the remote catalogue
+but not the local catalogue, including remote-only files, directories and
+unverified entries. It retains missing-remote paths and file/directory type
+conflicts at paths present on both sides. Rename candidates for missing local
+files remain visible. `--csv-omit-baseline-changes` omits only
+`local_baseline_changed` rows. Both flags work wherever `--csv` is supported
+(`report`, `compare`, `local`, `initial`, `quick`, `full`). They affect only CSV
+rows: saved discrepancies, JSON reports, terminal counts and exit codes remain
+unchanged. Use a new output filename; existing reports are never overwritten.
 
 `compare` selects the latest completed local scan (`local`, `initial`, `quick`,
 or `full`) and the last trusted remote snapshot in the same database. It requires
