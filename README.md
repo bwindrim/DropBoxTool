@@ -154,7 +154,30 @@ not automatic pairings. At most 20 rename candidates are emitted per local file.
 CSV contains raw filenames; import as text if opening untrusted names in a
 spreadsheet. Verbose logging reports hashing progress and remote pages.
 
-`initial` builds the baseline, `quick` reuses hashes for unchanged size and
+To build the local catalogue before connecting to Dropbox, use the initialized
+catalogue without setting any Dropbox credentials:
+
+```sh
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" -v local
+python3 dropbox_audit.py --db "$HOME/audit.sqlite" -v local --full
+```
+
+`local` enumerates and hashes the configured backup, reusing unchanged cached
+hashes. `--full` forces every hash to be recalculated. Rerun `local` after an
+interruption to reuse committed progress. It never loads the Dropbox SDK or
+contacts Dropbox, and leaves remote snapshots, cursors and comparisons untouched.
+The first successful local scan establishes the pinned local baseline; subsequent
+local scans report baseline removals and modifications. Incomplete scans record
+unverified entries and return 2 without establishing a baseline or inferring
+removals. A successful scan returns 0, or 1 for baseline discrepancies.
+Local summaries explicitly mark `comparison_performed` as false, with remote
+counts and identical counts set to null. `--csv` and `--json` also work with
+`local`. `report --scan ID` selects any saved local scan; plain `report` falls
+back to the latest successful local scan if no Dropbox comparison exists.
+Afterward, set your Dropbox credentials and run `initial` to perform the first
+remote comparison, reusing the local hash cache while preserving the baseline.
+
+`initial` builds the baseline if needed, `quick` reuses hashes for unchanged size and
 nanosecond mtime, and `full` hashes everything and lists Dropbox afresh.
 Quick mode can miss edits that preserve both metadata values; use full regularly.
 Retry an interrupted initial or quick scan to reuse committed hashes (committed

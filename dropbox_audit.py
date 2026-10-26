@@ -211,6 +211,14 @@ def compare(db, scan):
                 identical += 1
     for remote in db.execute("SELECT r.* FROM entries r WHERE scan=? AND side='remote' AND NOT EXISTS (SELECT 1 FROM entries l WHERE l.scan=r.scan AND l.side='local' AND l.path=r.path)", (scan,)):
         issue('unverified' if remote['error'] else 'directory_mismatch' if remote['kind'] == 'folder' else 'extra_remotely', remote['path'], detail=remote['error'] or 'extra remotely')
+    baseline_changes(db, scan, issue)
+    put(db, 'comparison_scan', scan)
+    put(db, 'identical', identical)
+    db.commit()
+    return identical
+
+
+def baseline_changes(db, scan, issue):
     baseline = setting(db, 'baseline_scan')
     if baseline:
         for old in db.execute("SELECT * FROM entries WHERE scan=? AND side='local'", (baseline,)):
@@ -219,10 +227,6 @@ def compare(db, scan):
                 issue('local_baseline_changed', old['path'], detail='removed' if now is None else 'modified or unverified')
     else:
         put(db, 'baseline_scan', scan)
-    put(db, 'comparison_scan', scan)
-    put(db, 'identical', identical)
-    db.commit()
-    return identical
 
 
 def safe_output(path, root, database):
@@ -241,6 +245,10 @@ def report(db, scan, csv_path=None, json_path=None):
     summary['identical'] = db.execute("SELECT count(*) FROM entries l JOIN entries r ON l.scan=r.scan AND l.path=r.path WHERE l.scan=? AND l.side='local' AND r.side='remote' AND l.kind='file' AND l.hash=r.hash AND l.error IS NULL AND r.error IS NULL", (scan,)).fetchone()[0]
     row = db.execute('SELECT * FROM scans WHERE id=?', (scan,)).fetchone()
     summary['scan'] = dict(row)
+    summary['comparison_performed'] = row['mode'] != 'local'
+    if row['mode'] == 'local':
+        summary['remote'] = None
+        summary['identical'] = None
     summary['duration_seconds'] = round((row['finished'] or time.time()) - row['started'], 2)
     print(json.dumps(summary, indent=2))
     fields = ['category', 'path', 'other', 'detail', 'is_new']
@@ -267,13 +275,15 @@ def main(argv=None):
     init = sub.add_parser('init')
     init.add_argument('--local-root', required=True, type=Path)
     init.add_argument('--dropbox-root', required=True)
-    for name in ('initial', 'quick', 'full', 'report'):
+    for name in ('initial', 'quick', 'full', 'local', 'report'):
         command = sub.add_parser(name)
         command.add_argument('--csv')
         command.add_argument('--json')
         if name == 'report':
             command.add_argument('--scan', type=int, help='Include failed scan diagnostics by scan ID')
-        if name != 'report':
+        if name == 'local':
+            command.add_argument('--full', action='store_true', help='Rehash every local file')
+        if name not in ('local', 'report'):
             command.add_argument('--rebuild-remote', action='store_true')
     sub.add_parser('history')
     args = parser.parse_args(argv)
@@ -317,9 +327,9 @@ def main(argv=None):
                 print(json.dumps(dict(row)))
             return 0
         if args.command == 'report':
-            scan_id = args.scan or setting(db, 'comparison_scan')
+            scan_id = args.scan or setting(db, 'comparison_scan') or setting(db, 'local_scan')
             if not scan_id:
-                raise ValueError('No complete comparison available')
+                raise ValueError('No completed local scan or comparison available')
             status = db.execute('SELECT status FROM scans WHERE id=?', (scan_id,)).fetchone()
             if status is None:
                 raise ValueError('Unknown scan ID')
@@ -330,8 +340,29 @@ def main(argv=None):
         s = root.stat()
         if f'{s.st_dev}:{s.st_ino}' != setting(db, 'root_identity'):
             raise ValueError('Local root identity changed; check that the correct disk is mounted')
-        if args.command == 'initial' and setting(db, 'baseline_scan'):
+        if args.command == 'initial' and setting(db, 'comparison_scan'):
             raise ValueError('Initial scan already completed; use quick or full')
+        if args.command == 'local':
+            db.execute("UPDATE scans SET status='interrupted',finished=? WHERE status='running'", (time.time(),))
+            scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', ('local', time.time(), 'running')).lastrowid
+            db.commit()
+            errors = local_scan(db, scan, root, args.full)
+            previous = setting(db, 'local_scan', '0')
+
+            def local_issue(category, path, other='', detail=''):
+                exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
+                db.execute('INSERT INTO issues VALUES (?,?,?,?,?,?)', (scan, category, path, other, detail, int(not exists)))
+
+            for row in db.execute("SELECT path,error FROM entries WHERE scan=? AND side='local' AND error IS NOT NULL", (scan,)):
+                local_issue('unverified', row['path'], detail=row['error'])
+            # A partial traversal must never establish a baseline or imply removals.
+            if not errors:
+                baseline_changes(db, scan, local_issue)
+                put(db, 'local_scan', scan)
+            db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if errors else 'complete', scan))
+            db.commit()
+            report(db, scan, csv_path, json_path)
+            return 2 if errors else int(db.execute('SELECT 1 FROM issues WHERE scan=? LIMIT 1', (scan,)).fetchone() is not None)
         import dropbox
         token = os.getenv('DROPBOX_ACCESS_TOKEN')
         refresh = os.getenv('DROPBOX_REFRESH_TOKEN')

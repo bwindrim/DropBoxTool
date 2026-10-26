@@ -124,6 +124,72 @@ class AuditTests(unittest.TestCase):
             (self.root / 'a').write_bytes(b'changed')
             self.assertEqual(audit.main(['--db', database, 'quick']), 1)
 
+    def test_local_only_workflow(self):
+        import contextlib
+        import io
+        database = str(Path(self.temp.name) / 'local.db')
+        (self.root / 'a').write_bytes(b'x')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.dict(os.environ, {}, clear=True), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')):
+            self.assertEqual(audit.main(['--db', database, 'init', '--local-root', str(self.root), '--dropbox-root', '/base']), 0)
+            csv_path = str(Path(self.temp.name) / 'local.csv')
+            json_path = str(Path(self.temp.name) / 'local.json')
+            self.assertEqual(audit.main(['--db', database, 'local', '--csv', csv_path, '--json', json_path]), 0)
+            with patch.object(audit, 'content_hash', side_effect=AssertionError('cache not used')):
+                self.assertEqual(audit.main(['--db', database, 'local']), 0)
+            with patch.object(audit, 'content_hash', wraps=audit.content_hash) as hashed:
+                self.assertEqual(audit.main(['--db', database, 'local', '--full']), 0)
+                self.assertEqual(hashed.call_count, 1)
+            self.assertEqual(audit.main(['--db', database, 'report', '--scan', '1']), 0)
+            self.assertEqual(audit.main(['--db', database, 'report']), 0)
+            (self.root / 'a').unlink()
+            self.assertEqual(audit.main(['--db', database, 'local']), 1)
+        import json
+        saved = json.loads(Path(json_path).read_text())
+        self.assertFalse(saved['summary']['comparison_performed'])
+        self.assertIsNone(saved['summary']['remote'])
+        self.assertEqual(saved['summary']['local']['files'], 1)
+        db = audit.connect(database)
+        self.addCleanup(db.close)
+        self.assertEqual(audit.setting(db, 'baseline_scan'), '1')
+        self.assertIsNone(audit.setting(db, 'comparison_scan'))
+        self.assertIsNone(audit.setting(db, 'cursor'))
+        self.assertEqual(db.execute("SELECT count(*) FROM entries WHERE side='remote'").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT category FROM issues WHERE scan=4").fetchone()[0], 'local_baseline_changed')
+        # A local baseline must not prevent the later first Dropbox comparison.
+        metadata = self.file('/base/a')
+        client = Mock()
+        client.files_list_folder.return_value = self.page([metadata], 'cursor')
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(os.environ, {'DROPBOX_ACCESS_TOKEN': 'fake'}), patch('dropbox.Dropbox', return_value=client):
+            self.assertEqual(audit.main(['--db', database, 'initial']), 1)
+            client.files_list_folder.assert_called_once()
+
+    def test_incomplete_local_scan_keeps_baseline_and_cursor(self):
+        import contextlib
+        import io
+        database = str(Path(self.temp.name) / 'incomplete.db')
+        (self.root / 'a').write_bytes(b'x')
+        with contextlib.redirect_stdout(io.StringIO()), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')):
+            self.assertEqual(audit.main(['--db', database, 'init', '--local-root', str(self.root), '--dropbox-root', '/base']), 0)
+            with patch.object(audit, 'content_hash', side_effect=OSError('unreadable')):
+                self.assertEqual(audit.main(['--db', database, 'local']), 2)
+            db = audit.connect(database)
+            self.assertIsNone(audit.setting(db, 'baseline_scan'))
+            self.assertIsNone(audit.setting(db, 'local_scan'))
+            self.assertEqual(db.execute('SELECT category FROM issues').fetchone()[0], 'unverified')
+            audit.put(db, 'cursor', 'trusted')
+            db.commit()
+            db.close()
+            self.assertEqual(audit.main(['--db', database, 'local']), 0)
+            with patch.object(audit, 'content_hash', side_effect=KeyboardInterrupt):
+                self.assertEqual(audit.main(['--db', database, 'local', '--full']), 2)
+            db = audit.connect(database)
+            self.assertEqual(audit.setting(db, 'baseline_scan'), '2')
+            self.assertEqual(audit.setting(db, 'local_scan'), '2')
+            self.assertEqual(audit.setting(db, 'cursor'), 'trusted')
+            self.assertEqual(db.execute('SELECT status FROM scans WHERE id=3').fetchone()[0], 'incomplete')
+            db.close()
+
     def test_remote_move_id_history(self):
         client = Mock()
         original = self.file('/base/a')
