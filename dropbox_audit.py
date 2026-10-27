@@ -27,14 +27,23 @@ Result = TypeVar('Result')
 
 
 class IssueReporter(Protocol):
-    def __call__(self, category: str, path: str, other: str = '', detail: str = '') -> None: ...
+    """Callback interface for recording a discrepancy and its optional diagnostics."""
+    def __call__(self, category: str, path: str, other: str = '', detail: str = '') -> None:
+        """Record one category/path discrepancy, optionally naming a related path."""
+        ...
 
 BLOCK = 4 * 1024 * 1024
 LOG = logging.getLogger(__name__)
 
 
 def content_hash(path: FilePath, *, dir_fd: int | None = None) -> tuple[str, os.stat_result]:
-    """Hash a stable regular file without following a final symbolic link."""
+    """Return a Dropbox content hash and the verified file metadata.
+
+    Read the regular file in 4 MiB blocks without following its final symlink.
+    For a relative path, dir_fd pins the parent directory. Raise OSError for
+    read failures, unsupported file types, or detected changes during hashing.
+    An empty file returns the SHA-256 digest of an empty digest sequence.
+    """
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     with os.fdopen(fd, 'rb') as source:
         before = os.fstat(source.fileno())
@@ -49,6 +58,7 @@ def content_hash(path: FilePath, *, dir_fd: int | None = None) -> tuple[str, os.
         after = os.fstat(source.fileno())
         current = os.stat(path, follow_symlinks=False, dir_fd=dir_fd)
         def signature(s: os.stat_result) -> tuple[int, int, int, int, int]:
+            """Select the identity and timestamps used to detect replacement or mutation."""
             return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
         if signature(before) != signature(after) or signature(after) != signature(current):
             raise OSError('file changed during hashing')
@@ -56,6 +66,11 @@ def content_hash(path: FilePath, *, dir_fd: int | None = None) -> tuple[str, os.
 
 
 def connect(path: FilePath) -> sqlite3.Connection:
+    """Open or create a SQLite catalogue and initialize its tables and indexes.
+
+    Enable WAL journaling and named-row access. The caller owns the returned
+    connection and must close it; no backup files or Dropbox data are changed.
+    """
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript('''
@@ -84,11 +99,13 @@ def setting(db: sqlite3.Connection, key: str, default: None = None) -> str | Non
 
 
 def setting(db: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    """Return a stored configuration string, or default when the key is absent."""
     row = db.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
     return row[0] if row else default
 
 
 def required_setting(db: sqlite3.Connection, key: str) -> str:
+    """Return a configuration string, raising ValueError if the key is absent."""
     value = setting(db, key)
     if value is None:
         raise ValueError(f'Catalogue is missing {key}; initialize a new database')
@@ -96,10 +113,15 @@ def required_setting(db: sqlite3.Connection, key: str) -> str:
 
 
 def put(db: sqlite3.Connection, key: str, value: str | int | Path) -> None:
+    """Store a configuration value as text without committing the transaction."""
     db.execute('INSERT OR REPLACE INTO config VALUES (?,?)', (key, str(value)))
 
 
 def normalized(path: str) -> str:
+    """Return an NFC-normalized, case-folded key for path diagnostics and lookup.
+
+    This key does not replace the original spelling stored in the catalogue.
+    """
     return unicodedata.normalize('NFC', path).casefold()
 
 
@@ -107,21 +129,37 @@ def entry(db: sqlite3.Connection, scan: ScanId, side: str, path: str, kind: str,
           size: int | None = None, mtime: str | None = None, hash: str | None = None,
           file_id: str | None = None, verified: float | None = None,
           error: str | None = None) -> None:
+    """Insert or replace one path in a scan's local or remote catalogue.
+
+    Paths are relative to the configured root. Metadata may be absent for
+    folders or unverified entries; error records why verification failed.
+    The caller controls transaction commits.
+    """
     db.execute('INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                (scan, side, path, kind, size, mtime, hash, file_id, verified, error, normalized(path)))
 
 
 def ignores_hidden(db: sqlite3.Connection, scan: ScanId) -> bool:
+    """Return whether this scan excluded local dotfiles; older scans default to false."""
     row = db.execute('SELECT ignore_hidden FROM scan_options WHERE scan=?', (scan,)).fetchone()
     return bool(row and row[0])
 
 
 def local_scan(db: sqlite3.Connection, scan: ScanId, root: Path,
                full: bool = False, ignore_hidden: bool = False) -> int:
+    """Catalogue root without following symlinks and return the number of errors.
+
+    Reuse hashes when size and nanosecond mtime match the cache unless full
+    is true. With ignore_hidden, omit dotfiles while still traversing hidden
+    directories. Record unreadable or unstable entries as errors, and commit
+    progress every 100 entries and at directory boundaries for restartability.
+    The caller determines scan completion and whether to establish a baseline.
+    """
     db.execute('INSERT OR REPLACE INTO scan_options VALUES (?,?)', (scan, int(ignore_hidden)))
     db.commit()
     errors = 0
     def traversal_error(exc: OSError) -> None:
+        """Persist a directory traversal failure so unseen children are not treated as deleted."""
         nonlocal errors
         errors += 1
         path = os.path.relpath(exc.filename or root, root)
@@ -162,6 +200,12 @@ def local_scan(db: sqlite3.Connection, scan: ScanId, root: Path,
 
 
 def request(call: Callable[..., Result], *args: Any, **kwargs: Any) -> Result:
+    """Call a Dropbox metadata operation with at most four attempts.
+
+    Forward arguments and return the operation's result. Retry rate limits,
+    server failures and network errors with bounded delays. Propagate other
+    errors immediately, and raise RuntimeError when a backoff exceeds 60 seconds.
+    """
     from dropbox.exceptions import RateLimitError, InternalServerError
     from requests.exceptions import RequestException
     for attempt in range(4):
@@ -180,6 +224,14 @@ def request(call: Callable[..., Result], *args: Any, **kwargs: Any) -> Result:
 
 def remote_scan(db: sqlite3.Connection, scan: ScanId, client: Dropbox,
                 root: str, fresh: bool = False) -> None:
+    """Save a complete Dropbox metadata snapshot and its cursor in one transaction.
+
+    Apply paginated changes to the previous trusted snapshot, or list root
+    recursively when fresh is true or no cursor exists. Process deletion
+    subtrees and retain ID-based move/modification history. Failures roll back
+    the new snapshot and cursor, preserving the trusted catalogue. Only
+    metadata endpoints are called; file contents are never transferred.
+    """
     from dropbox.files import FileMetadata, FolderMetadata, DeletedMetadata
     previous = setting(db, 'remote_scan')
     cursor = None if fresh else setting(db, 'cursor')
@@ -238,8 +290,17 @@ def remote_scan(db: sqlite3.Connection, scan: ScanId, client: Dropbox,
 
 
 def compare(db: sqlite3.Connection, scan: ScanId, *, commit: bool = True) -> int:
+    """Record discrepancies for the two catalogues belonging to scan.
+
+    Return the number of same-path files with matching hashes. Retain exact
+    path spellings, report normalization collisions and rename candidates,
+    and check the pinned local baseline. Update the latest comparison pointer.
+    Set commit to false when the caller owns the surrounding transaction;
+    this function expects a new scan and does not clear existing issues.
+    """
     previous = setting(db, 'comparison_scan', '0')
     def issue(category: str, path: str, other: str = '', detail: str = '') -> None:
+        """Record a discrepancy and whether it was absent from the previous comparison."""
         exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
         db.execute('INSERT INTO issues VALUES (?,?,?,?,?,?)', (scan, category, path, other, detail, int(not exists)))
     identical = 0
@@ -277,6 +338,12 @@ def compare(db: sqlite3.Connection, scan: ScanId, *, commit: bool = True) -> int
 
 
 def baseline_changes(db: sqlite3.Connection, scan: ScanId, issue: IssueReporter) -> None:
+    """Report local removals and content/type changes through issue.
+
+    Compare scan with the first successful local baseline, skipping dotfiles
+    when this scan excludes them. If no baseline exists, pin scan instead.
+    Call only after a complete local traversal; the caller commits changes.
+    """
     baseline = setting(db, 'baseline_scan')
     ignore_hidden = ignores_hidden(db, scan)
     if baseline:
@@ -291,7 +358,14 @@ def baseline_changes(db: sqlite3.Connection, scan: ScanId, issue: IssueReporter)
 
 
 def offline_compare(db: sqlite3.Connection) -> int:
-    """Compare saved snapshots atomically, without consulting either directory tree."""
+    """Return a new comparison ID using saved local and remote catalogues.
+
+    Select the latest completed local scan and the trusted remote snapshot,
+    raising ValueError if either is unavailable. Copy their entries, preserve
+    source IDs and local filtering options, and save discrepancies atomically.
+    Neither tree is scanned, and remote state is only as recent as its source
+    snapshot. Existing baseline, cache and Dropbox cursor are preserved.
+    """
     local = db.execute("SELECT id FROM scans WHERE status='complete' AND mode IN ('local','initial','quick','full') ORDER BY id DESC LIMIT 1").fetchone()
     remote = setting(db, 'remote_scan')
     if local is None:
@@ -316,6 +390,11 @@ def offline_compare(db: sqlite3.Connection) -> int:
 
 
 def safe_output(path: FilePath, root: Path, database: Path) -> Path:
+    """Resolve an output path and reject destinations inside the backup or at the database.
+
+    Raise ValueError for rejected paths. This validates the destination only;
+    report creation separately refuses to overwrite an existing file.
+    """
     root = root.resolve()
     resolved = Path(path).expanduser().resolve()
     if resolved == root or root in resolved.parents:
@@ -328,6 +407,13 @@ def safe_output(path: FilePath, root: Path, database: Path) -> Path:
 def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = None,
            json_path: FilePath | None = None, *, csv_omit_remote_only: bool = False,
            csv_omit_baseline_changes: bool = False) -> None:
+    """Print a saved scan summary and optionally create CSV and JSON reports.
+
+    CSV options omit remote-only paths or local baseline changes from CSV
+    rows alone; summaries, JSON and stored issues remain unchanged. Files are
+    created exclusively, raising FileExistsError rather than overwriting.
+    Offline comparison summaries include source scan IDs and timestamps.
+    """
     summary: dict[str, Any] = {side: dict(db.execute("SELECT count(*) AS files,coalesce(sum(size),0) AS bytes FROM entries WHERE scan=? AND side=? AND kind='file'", (scan, side)).fetchone()) for side in ('local', 'remote')}
     summary['discrepancies'] = dict(db.execute('SELECT category,count(*) FROM issues WHERE scan=? GROUP BY category', (scan,)))
     summary['identical'] = db.execute("SELECT count(*) FROM entries l JOIN entries r ON l.scan=r.scan AND l.path=r.path WHERE l.scan=? AND l.side='local' AND r.side='remote' AND l.kind='file' AND l.hash=r.hash AND l.error IS NULL AND r.error IS NULL", (scan,)).fetchone()[0]
@@ -374,6 +460,14 @@ def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = Non
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Parse CLI arguments, execute the selected operation and return its exit code.
+
+    Return 0 for a successful match or local scan, 1 for discrepancies, and
+    2 for incomplete scans or operational errors. Use a catalogue lock to
+    prevent concurrent writers. Scanning commands validate the mounted root;
+    offline compare and report require no backup mount or Dropbox credentials.
+    Record scan failures without exposing SDK request details or credentials.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--db', required=True, type=Path)
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -473,6 +567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             previous = setting(db, 'local_scan', '0')
 
             def local_issue(category: str, path: str, other: str = '', detail: str = '') -> None:
+                """Record a local discrepancy, marking novelty against the preceding local scan."""
                 exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
                 db.execute('INSERT INTO issues VALUES (?,?,?,?,?,?)', (scan, category, path, other, detail, int(not exists)))
 
