@@ -459,6 +459,43 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(result['summary']['complete'])
         self.assertEqual(result['groups'], [])
 
+    def test_duplicates_subdirectories_scope_counts_and_boundaries(self):
+        import contextlib
+        import io
+        import json
+        audit.put(self.db, 'remote_scan', 1)
+        audit.put(self.db, 'dropbox_root', '/Photos')
+        self.db.execute("INSERT INTO scans VALUES (1,'full',1,2,'complete',NULL)")
+        for directory in ('A', 'A/nested', 'B', 'A_other', 'wild%_'):
+            audit.entry(self.db, 1, 'remote', directory, 'folder')
+        for path in ('A/one', 'A/nested/two', 'B/three', 'A_other/four', 'wild%_/five'):
+            audit.entry(self.db, 1, 'remote', path, 'file', size=3, hash='same')
+        audit.entry(self.db, 1, 'remote', 'B/unknown', 'file', size=3)
+        def run(directories):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = audit.duplicates_report(self.db, directories=directories)
+            return code, json.loads(output.getvalue())
+        code, result = run(['a', '/A/nested/'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['summary']['files_scanned'], 2)
+        self.assertEqual(result['summary']['redundant_bytes'], 3)
+        self.assertEqual({f['path'] for f in result['groups'][0]['files']}, {'A/one', 'A/nested/two'})
+        code, result = run(['A/nested', 'B'])
+        self.assertEqual(code, 2)
+        self.assertEqual(result['summary']['files_scanned'], 3)
+        self.assertEqual(result['summary']['duplicate_files'], 2)
+        self.assertEqual(result['unverified'][0]['path'], 'B/unknown')
+        code, result = run(['wild%_'])
+        self.assertEqual(code, 0)
+        self.assertEqual(result['summary']['files_scanned'], 1)
+        for directory in ('missing', 'A/one', 'A/../B', 'A//nested'):
+            with self.assertRaises(ValueError):
+                run([directory])
+        self.assertEqual(run(['/'])[1]['summary']['files_scanned'], 6)
+        args = audit.build_parser().parse_args(['--db', 'audit.sqlite', 'duplicates', 'A', 'B', '--csv', 'out.csv'])
+        self.assertEqual(args.directories, ['A', 'B'])
+
     def test_safe_output(self):
         with self.assertRaises(ValueError):
             audit.safe_output(self.root / 'db', self.root, Path('/other'))

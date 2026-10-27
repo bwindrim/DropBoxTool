@@ -460,7 +460,8 @@ def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = Non
 
 
 def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
-                      json_path: FilePath | None = None) -> int:
+                      json_path: FilePath | None = None, *,
+                      directories: Sequence[str] = ()) -> int:
     """Report duplicate content in the last trusted remote snapshot, entirely offline."""
     source = setting(db, 'remote_scan')
     if source is None:
@@ -468,24 +469,44 @@ def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
     row = db.execute('SELECT id,mode,started,finished,status FROM scans WHERE id=?', (source,)).fetchone()
     if row is None:
         raise ValueError('Saved remote catalogue refers to an unknown scan')
+    roots: list[str] = []
+    for directory in directories:
+        directory = directory.strip('/')
+        if directory and any(part in ('', '.', '..') for part in directory.split('/')):
+            raise ValueError('Subdirectories must not contain empty, . or .. components')
+        if directory and not db.execute(
+            "SELECT 1 FROM entries WHERE scan=? AND side='remote' AND kind='folder' AND norm=?",
+            (source, normalized(directory)),
+        ).fetchone():
+            raise ValueError(f'Subdirectory not found in saved remote catalogue: {directory!r}')
+        roots.append(directory)
+    # Match literal directory boundaries; SQL LIKE would treat % and _ as wildcards.
+    scope = "scan=? AND side='remote' AND kind='file'"
+    parameters: list[Any] = [source]
+    if roots and '' not in roots:
+        scope += ' AND (' + ' OR '.join('substr(norm,1,?)=?' for _ in roots) + ')'
+        for directory in roots:
+            prefix = normalized(directory) + '/'
+            parameters.extend((len(prefix), prefix))
     groups = []
-    valid = "scan=? AND side='remote' AND kind='file' AND error IS NULL AND hash IS NOT NULL AND hash<>'' AND size IS NOT NULL AND size>=0"
+    valid = scope + " AND error IS NULL AND hash IS NOT NULL AND hash<>'' AND size IS NOT NULL AND size>=0"
     for size, digest, count in db.execute(
         'SELECT size,hash,count(*) FROM entries WHERE ' + valid +
-        ' GROUP BY size,hash HAVING count(*)>1 ORDER BY size DESC,hash', (source,)
+        ' GROUP BY size,hash HAVING count(*)>1 ORDER BY size DESC,hash', parameters
     ):
         files = [dict(item) for item in db.execute(
             'SELECT path,file_id FROM entries WHERE ' + valid + ' AND size=? AND hash=? ORDER BY path',
-            (source, size, digest))]
+            [*parameters, size, digest])]
         groups.append({'content_hash': digest, 'size': size, 'copies': count,
                        'redundant_bytes': size * (count - 1), 'files': files})
     unverified = [dict(item) for item in db.execute(
-        "SELECT path,error FROM entries WHERE scan=? AND side='remote' AND kind='file' "
-        "AND (error IS NOT NULL OR hash IS NULL OR hash='' OR size IS NULL OR size<0) ORDER BY path", (source,))]
+        'SELECT path,error FROM entries WHERE ' + scope +
+        " AND (error IS NOT NULL OR hash IS NULL OR hash='' OR size IS NULL OR size<0) ORDER BY path", parameters)]
     summary = {
         'source': dict(row), 'dropbox_root': required_setting(db, 'dropbox_root') or '/',
+        'subdirectories': roots or ['/'],
         'remote_state_note': 'Saved Dropbox metadata only; Dropbox has not been contacted. Paths are relative to dropbox_root.',
-        'files_scanned': db.execute("SELECT count(*) FROM entries WHERE scan=? AND side='remote' AND kind='file'", (source,)).fetchone()[0],
+        'files_scanned': db.execute('SELECT count(*) FROM entries WHERE ' + scope, parameters).fetchone()[0],
         'duplicate_groups': len(groups), 'duplicate_files': sum(g['copies'] for g in groups),
         'redundant_copies': sum(g['copies'] - 1 for g in groups),
         'redundant_bytes': sum(g['redundant_bytes'] for g in groups),
@@ -655,6 +676,8 @@ folder path in the app's accessible namespace. Use a new database to change root
                'outside the backup. Exit: 0 = no duplicates, 1 = duplicates, 2 = incomplete/error.',
     )
     duplicates.add_argument('--csv', metavar='FILE', help='Create a CSV with one row per duplicate member.')
+    duplicates.add_argument('directories', nargs='*', metavar='SUBDIRECTORY',
+                            help='Restrict to these saved folders and descendants, relative to the configured Dropbox root (optional leading slash). Default: entire saved tree.')
     duplicates.add_argument('--json', metavar='FILE', help='Create a full JSON duplicate report, including unverified paths.')
     sub.add_parser(
         'history', help='List scan IDs, modes, timestamps and completion status.',
@@ -723,7 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(dict(row)))
             return 0
         if args.command == 'duplicates':
-            return duplicates_report(db, csv_path, json_path)
+            return duplicates_report(db, csv_path, json_path, directories=args.directories)
         if args.command == 'report':
             scan_id = args.scan or setting(db, 'comparison_scan') or setting(db, 'local_scan')
             if not scan_id:

@@ -362,3 +362,19 @@ Reports require new filenames outside the local backup. CSV filenames should be
 imported as text in spreadsheets. This command does not change saved snapshots,
 cursors, comparison results, baselines or scan history. Groups and unverified
 paths are assembled in memory for reporting.
+
+Restrict the saved-catalogue check to selected subdirectories and all their
+ descendants by supplying positional arguments:
+
+```sh
+python3 dropbox_audit.py --db audit.sqlite duplicates Holidays Archive/Family --csv selected-duplicates.csv
+```
+
+Subdirectory paths are relative to the catalogue's configured Dropbox root;
+for a root of `/Photos`, `Holidays` selects `/Photos/Holidays`. An optional leading
+slash has the same root-relative meaning. Omit paths (or use `/`) to check the
+entire saved tree. Selected folders must exist in the saved remote catalogue;
+unknown folders, file paths, and `.` or `..` components are rejected. Matching is
+case insensitive and treats wildcard characters literally. Overlapping selections
+count each file once. Groups can span selected folders; counts, unverified paths,
+exit codes and both exports all reflect only the selected scope.
