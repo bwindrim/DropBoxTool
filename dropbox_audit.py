@@ -14,12 +14,26 @@ import stat
 import sys
 import time
 import unicodedata
+from collections.abc import Callable, Sequence
+from typing import Any, Protocol, TYPE_CHECKING, TypeVar, Union, overload
+
+if TYPE_CHECKING:
+    from dropbox import Dropbox
+
+# Configuration values store scan IDs as text; SQLite accepts either form.
+ScanId = Union[int, str]
+FilePath = Union[str, os.PathLike[str]]
+Result = TypeVar('Result')
+
+
+class IssueReporter(Protocol):
+    def __call__(self, category: str, path: str, other: str = '', detail: str = '') -> None: ...
 
 BLOCK = 4 * 1024 * 1024
 LOG = logging.getLogger(__name__)
 
 
-def content_hash(path, *, dir_fd=None):
+def content_hash(path: FilePath, *, dir_fd: int | None = None) -> tuple[str, os.stat_result]:
     """Hash a stable regular file without following a final symbolic link."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     with os.fdopen(fd, 'rb') as source:
@@ -34,13 +48,14 @@ def content_hash(path, *, dir_fd=None):
             digest.update(hashlib.sha256(block).digest())
         after = os.fstat(source.fileno())
         current = os.stat(path, follow_symlinks=False, dir_fd=dir_fd)
-        signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        def signature(s: os.stat_result) -> tuple[int, int, int, int, int]:
+            return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
         if signature(before) != signature(after) or signature(after) != signature(current):
             raise OSError('file changed during hashing')
         return digest.hexdigest(), after
 
 
-def connect(path):
+def connect(path: FilePath) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript('''
@@ -60,35 +75,53 @@ def connect(path):
     return db
 
 
-def setting(db, key, default=None):
+@overload
+def setting(db: sqlite3.Connection, key: str, default: str) -> str: ...
+
+
+@overload
+def setting(db: sqlite3.Connection, key: str, default: None = None) -> str | None: ...
+
+
+def setting(db: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
     row = db.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
     return row[0] if row else default
 
 
-def put(db, key, value):
+def required_setting(db: sqlite3.Connection, key: str) -> str:
+    value = setting(db, key)
+    if value is None:
+        raise ValueError(f'Catalogue is missing {key}; initialize a new database')
+    return value
+
+
+def put(db: sqlite3.Connection, key: str, value: str | int | Path) -> None:
     db.execute('INSERT OR REPLACE INTO config VALUES (?,?)', (key, str(value)))
 
 
-def normalized(path):
+def normalized(path: str) -> str:
     return unicodedata.normalize('NFC', path).casefold()
 
 
-def entry(db, scan, side, path, kind, size=None, mtime=None, hash=None,
-          file_id=None, verified=None, error=None):
+def entry(db: sqlite3.Connection, scan: ScanId, side: str, path: str, kind: str,
+          size: int | None = None, mtime: str | None = None, hash: str | None = None,
+          file_id: str | None = None, verified: float | None = None,
+          error: str | None = None) -> None:
     db.execute('INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                (scan, side, path, kind, size, mtime, hash, file_id, verified, error, normalized(path)))
 
 
-def ignores_hidden(db, scan):
+def ignores_hidden(db: sqlite3.Connection, scan: ScanId) -> bool:
     row = db.execute('SELECT ignore_hidden FROM scan_options WHERE scan=?', (scan,)).fetchone()
     return bool(row and row[0])
 
 
-def local_scan(db, scan, root, full=False, ignore_hidden=False):
+def local_scan(db: sqlite3.Connection, scan: ScanId, root: Path,
+               full: bool = False, ignore_hidden: bool = False) -> int:
     db.execute('INSERT OR REPLACE INTO scan_options VALUES (?,?)', (scan, int(ignore_hidden)))
     db.commit()
     errors = 0
-    def traversal_error(exc):
+    def traversal_error(exc: OSError) -> None:
         nonlocal errors
         errors += 1
         path = os.path.relpath(exc.filename or root, root)
@@ -128,7 +161,7 @@ def local_scan(db, scan, root, full=False, ignore_hidden=False):
     return errors
 
 
-def request(call, *args, **kwargs):
+def request(call: Callable[..., Result], *args: Any, **kwargs: Any) -> Result:
     from dropbox.exceptions import RateLimitError, InternalServerError
     from requests.exceptions import RequestException
     for attempt in range(4):
@@ -142,9 +175,11 @@ def request(call, *args, **kwargs):
                 raise RuntimeError('Rate limit requires a longer wait; retry this scan later') from None
             LOG.warning('Retrying metadata request in %ss', delay)
             time.sleep(delay)
+    raise AssertionError('Retry loop exhausted without returning or raising')
 
 
-def remote_scan(db, scan, client, root, fresh=False):
+def remote_scan(db: sqlite3.Connection, scan: ScanId, client: Dropbox,
+                root: str, fresh: bool = False) -> None:
     from dropbox.files import FileMetadata, FolderMetadata, DeletedMetadata
     previous = setting(db, 'remote_scan')
     cursor = None if fresh else setting(db, 'cursor')
@@ -202,9 +237,9 @@ def remote_scan(db, scan, client, root, fresh=False):
         put(db, 'remote_scan', scan)
 
 
-def compare(db, scan, *, commit=True):
+def compare(db: sqlite3.Connection, scan: ScanId, *, commit: bool = True) -> int:
     previous = setting(db, 'comparison_scan', '0')
-    def issue(category, path, other='', detail=''):
+    def issue(category: str, path: str, other: str = '', detail: str = '') -> None:
         exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
         db.execute('INSERT INTO issues VALUES (?,?,?,?,?,?)', (scan, category, path, other, detail, int(not exists)))
     identical = 0
@@ -241,7 +276,7 @@ def compare(db, scan, *, commit=True):
     return identical
 
 
-def baseline_changes(db, scan, issue):
+def baseline_changes(db: sqlite3.Connection, scan: ScanId, issue: IssueReporter) -> None:
     baseline = setting(db, 'baseline_scan')
     ignore_hidden = ignores_hidden(db, scan)
     if baseline:
@@ -255,7 +290,7 @@ def baseline_changes(db, scan, issue):
         put(db, 'baseline_scan', scan)
 
 
-def offline_compare(db):
+def offline_compare(db: sqlite3.Connection) -> int:
     """Compare saved snapshots atomically, without consulting either directory tree."""
     local = db.execute("SELECT id FROM scans WHERE status='complete' AND mode IN ('local','initial','quick','full') ORDER BY id DESC LIMIT 1").fetchone()
     remote = setting(db, 'remote_scan')
@@ -268,6 +303,8 @@ def offline_compare(db):
     # Include empty successful catalogues: entry counts do not indicate completeness.
     with db:
         scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', ('compare', time.time(), 'running')).lastrowid
+        if scan is None:
+            raise RuntimeError('SQLite did not return an ID for the new scan')
         for side, source in (('local', local_id), ('remote', remote_id)):
             db.execute('INSERT INTO entries SELECT ?,side,path,kind,size,mtime,hash,file_id,verified,error,norm FROM entries WHERE scan=? AND side=?', (scan, source, side))
         db.execute('INSERT INTO comparison_sources VALUES (?,?,?)', (scan, local_id, remote_id))
@@ -278,7 +315,7 @@ def offline_compare(db):
     return scan
 
 
-def safe_output(path, root, database):
+def safe_output(path: FilePath, root: Path, database: Path) -> Path:
     root = root.resolve()
     resolved = Path(path).expanduser().resolve()
     if resolved == root or root in resolved.parents:
@@ -288,9 +325,10 @@ def safe_output(path, root, database):
     return resolved
 
 
-def report(db, scan, csv_path=None, json_path=None, *,
-           csv_omit_remote_only=False, csv_omit_baseline_changes=False):
-    summary = {side: dict(db.execute("SELECT count(*) AS files,coalesce(sum(size),0) AS bytes FROM entries WHERE scan=? AND side=? AND kind='file'", (scan, side)).fetchone()) for side in ('local', 'remote')}
+def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = None,
+           json_path: FilePath | None = None, *, csv_omit_remote_only: bool = False,
+           csv_omit_baseline_changes: bool = False) -> None:
+    summary: dict[str, Any] = {side: dict(db.execute("SELECT count(*) AS files,coalesce(sum(size),0) AS bytes FROM entries WHERE scan=? AND side=? AND kind='file'", (scan, side)).fetchone()) for side in ('local', 'remote')}
     summary['discrepancies'] = dict(db.execute('SELECT category,count(*) FROM issues WHERE scan=? GROUP BY category', (scan,)))
     summary['identical'] = db.execute("SELECT count(*) FROM entries l JOIN entries r ON l.scan=r.scan AND l.path=r.path WHERE l.scan=? AND l.side='local' AND r.side='remote' AND l.kind='file' AND l.hash=r.hash AND l.error IS NULL AND r.error IS NULL", (scan,)).fetchone()[0]
     row = db.execute('SELECT * FROM scans WHERE id=?', (scan,)).fetchone()
@@ -335,7 +373,7 @@ def report(db, scan, csv_path=None, json_path=None, *,
             target.write(']}\n')
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--db', required=True, type=Path)
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -361,13 +399,13 @@ def main(argv=None):
             command.add_argument('--rebuild-remote', action='store_true')
     sub.add_parser('history')
     args = parser.parse_args(argv)
-    csv_options = {
+    csv_options: dict[str, bool] = {
         'csv_omit_remote_only': getattr(args, 'csv_omit_remote_only', False),
         'csv_omit_baseline_changes': getattr(args, 'csv_omit_baseline_changes', False),
     }
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
-    db = None
-    scan = None
+    db: sqlite3.Connection | None = None
+    scan: int | None = None
     lock = None
     try:
         database = args.db.expanduser().resolve()
@@ -397,7 +435,7 @@ def main(argv=None):
             db.commit()
             print('Catalogue initialized. Roots are pinned; credentials are read from the environment.')
             return 0
-        root = Path(setting(db, 'local_root'))
+        root = Path(required_setting(db, 'local_root'))
         csv_path = safe_output(args.csv, root, database) if getattr(args, 'csv', None) else None
         json_path = safe_output(args.json, root, database) if getattr(args, 'json', None) else None
         if args.command == 'history':
@@ -428,11 +466,13 @@ def main(argv=None):
         if args.command == 'local':
             db.execute("UPDATE scans SET status='interrupted',finished=? WHERE status='running'", (time.time(),))
             scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', ('local', time.time(), 'running')).lastrowid
+            if scan is None:
+                raise RuntimeError('SQLite did not return an ID for the new scan')
             db.commit()
             errors = local_scan(db, scan, root, args.full, ignore_hidden=args.ignore_hidden)
             previous = setting(db, 'local_scan', '0')
 
-            def local_issue(category, path, other='', detail=''):
+            def local_issue(category: str, path: str, other: str = '', detail: str = '') -> None:
                 exists = db.execute('SELECT 1 FROM issues WHERE scan=? AND category=? AND path=? AND other=?', (previous, category, path, other)).fetchone()
                 db.execute('INSERT INTO issues VALUES (?,?,?,?,?,?)', (scan, category, path, other, detail, int(not exists)))
 
@@ -458,11 +498,13 @@ def main(argv=None):
         # A prior running scan was interrupted. Its cache remains usable, but never its snapshot.
         db.execute("UPDATE scans SET status='interrupted',finished=? WHERE status='running'", (time.time(),))
         scan = db.execute('INSERT INTO scans(mode,started,status) VALUES (?,?,?)', (args.command, time.time(), 'running')).lastrowid
+        if scan is None:
+            raise RuntimeError('SQLite did not return an ID for the new scan')
         db.commit()
         errors = local_scan(db, scan, root, args.command == 'full', ignore_hidden=args.ignore_hidden)
         if errors:
             raise RuntimeError('Local scan incomplete; trusted comparison retained. Inspect entries.error for this scan.')
-        remote_scan(db, scan, client, setting(db, 'dropbox_root'), args.command != 'quick' or args.rebuild_remote)
+        remote_scan(db, scan, client, required_setting(db, 'dropbox_root'), args.command != 'quick' or args.rebuild_remote)
         compare(db, scan)
         incomplete = db.execute("SELECT 1 FROM issues WHERE scan=? AND category='unverified'", (scan,)).fetchone()
         db.execute('UPDATE scans SET finished=?,status=? WHERE id=?', (time.time(), 'incomplete' if incomplete else 'complete', scan))
