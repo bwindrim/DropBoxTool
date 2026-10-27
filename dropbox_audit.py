@@ -459,6 +459,156 @@ def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = Non
             target.write(']}\n')
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build command help for setup, scanning, updates and saved reports."""
+    formatter = argparse.RawDescriptionHelpFormatter
+    parser = argparse.ArgumentParser(
+        description=(
+            'Verify a local backup against Dropbox using content hashes and saved SQLite catalogues.\n'
+            'Reads local files and Dropbox metadata only; never synchronizes or repairs files.'
+        ),
+        formatter_class=formatter,
+        epilog='''Typical workflow (global options go BEFORE the command):
+  1. Configure independent roots; no scanning or Dropbox credentials needed:
+     python3 dropbox_audit.py --db audit.sqlite init --local-root /Volumes/Backup/Photos --dropbox-root /Photos
+  2. Scan the local backup without contacting Dropbox (optional before initial):
+     python3 dropbox_audit.py --db audit.sqlite -v local --ignore-hidden
+  3. Fetch Dropbox metadata and perform the first comparison:
+     export DROPBOX_ACCESS_TOKEN='your-token'
+     python3 dropbox_audit.py --db audit.sqlite -v initial --ignore-hidden --csv initial.csv
+  4. Update both catalogues and compare after later changes:
+     python3 dropbox_audit.py --db audit.sqlite -v quick --ignore-hidden --csv update.csv
+  5. Or rescan only locally, then compare against SAVED Dropbox metadata:
+     python3 dropbox_audit.py --db audit.sqlite local --ignore-hidden
+     python3 dropbox_audit.py --db audit.sqlite compare --csv offline.csv
+
+Command names: local/initial/full perform scans; quick performs incremental updates.
+There are no separate commands named "scan" or "update".
+Use COMMAND --help for its options and more examples.
+
+Authentication (initial, quick, full only):
+  Set DROPBOX_ACCESS_TOKEN, or DROPBOX_REFRESH_TOKEN with DROPBOX_APP_KEY
+  (and DROPBOX_APP_SECRET for confidential apps). Required OAuth scope:
+  files.metadata.read. Secrets are read from the environment, never stored in SQLite.
+
+Safety and results:
+  Keep the database and reports outside the local backup. Reports must use new
+  filenames; existing files are never overwritten. The first successful local
+  catalogue pins the baseline; later scans retain historical records.
+  Exit codes: 0 = match/success, 1 = discrepancies, 2 = incomplete/error.
+  CSV filters do not change saved discrepancies, summary counts or exit codes.''',
+    )
+    parser.add_argument('--db', required=True, type=Path, metavar='DATABASE',
+                        help='SQLite catalogue path; init creates it, other commands require it to exist. Keep outside the backup.')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Log local scan progress, Dropbox metadata pages and retries. Place before the command.')
+    sub = parser.add_subparsers(dest='command', required=True, title='commands', metavar='COMMAND')
+    init = sub.add_parser(
+        'init', help='Create a catalogue and pin the local and Dropbox roots; do not scan.',
+        description='Create a new SQLite catalogue and record the two independent roots.\n'
+                    'Does not read file contents or contact Dropbox. Existing catalogues cannot be reinitialized.',
+        formatter_class=formatter,
+        epilog='''Example:
+  python3 dropbox_audit.py --db audit.sqlite init --local-root /Volumes/Backup/Photos --dropbox-root /Photos
+
+The local root must exist. Its device/inode identity is pinned to detect a
+changed mount on later scans. Use / as the Dropbox account root, or an absolute
+folder path in the app's accessible namespace. Use a new database to change roots.''',
+    )
+    init.add_argument('--local-root', required=True, type=Path, metavar='DIRECTORY',
+                      help='Existing authoritative local backup directory, scanned recursively.')
+    init.add_argument('--dropbox-root', required=True, metavar='DROPBOX_PATH',
+                      help='Corresponding Dropbox folder, e.g. /Photos; use / for the account root. Independent of local path.')
+    descriptions = {
+        'initial': (
+            'Build the first Dropbox catalogue and compare with the local backup.',
+            'Rescan local metadata, reusing unchanged cached hashes, and fetch a fresh complete\n'
+            'Dropbox listing. Compare the catalogues and save discrepancies. Requires OAuth\n'
+            'credentials. Run once before using quick; an earlier local-only scan is optional.',
+            'python3 dropbox_audit.py --db audit.sqlite -v initial --ignore-hidden --csv initial.csv',
+        ),
+        'quick': (
+            'Update local hashes and saved Dropbox metadata, then compare.',
+            'Rescan local metadata and rehash only files whose size or mtime changed.\n'
+            'Apply Dropbox updates using the saved cursor (fresh listing if none exists),\n'
+            'then compare. Requires OAuth credentials and contacts Dropbox. Edits preserving\n'
+            'size and mtime may be missed; use full periodically.',
+            'python3 dropbox_audit.py --db audit.sqlite -v quick --ignore-hidden --csv update.csv',
+        ),
+        'full': (
+            'Rehash every local file and rebuild Dropbox metadata, then compare.',
+            'Perform a full integrity verification: recalculate every local content hash,\n'
+            'regardless of cached metadata, and fetch a fresh complete Dropbox listing.\n'
+            'Requires OAuth credentials. May take hours on large backups; file contents\n'
+            'are read locally only, never downloaded from Dropbox.',
+            'python3 dropbox_audit.py --db audit.sqlite -v full --csv full-check.csv',
+        ),
+        'local': (
+            'Scan and hash the local backup without contacting Dropbox.',
+            'Build a new local catalogue, reusing hashes when size and mtime are unchanged.\n'
+            'No Dropbox credentials required. The first successful scan pins the local\n'
+            'baseline; later scans report removals and content/type changes against it.\n'
+            'Retry this command after interruption to reuse committed hash progress.',
+            'python3 dropbox_audit.py --db audit.sqlite -v local --ignore-hidden\n'
+            '  python3 dropbox_audit.py --db audit.sqlite -v local --full --json local-check.json',
+        ),
+        'compare': (
+            'Compare saved local and remote catalogues entirely offline.',
+            'Compare the latest completed local scan with the last trusted remote snapshot\n'
+            'in this database. Neither tree is rescanned; no credentials or mounted backup\n'
+            'are required. Dropbox findings reflect the SAVED remote state, not its live\n'
+            'state. Save a new comparison with source scan IDs and timestamps.',
+            'python3 dropbox_audit.py --db audit.sqlite compare --csv offline.csv\n'
+            '  python3 dropbox_audit.py --db audit.sqlite compare --csv focused.csv --csv-omit-remote-only --csv-omit-baseline-changes',
+        ),
+        'report': (
+            'Display or export an existing scan result without comparing again.',
+            'Display the latest saved comparison, or the latest successful local-only scan\n'
+            'if no comparison exists. Use --scan to select an older or incomplete scan\n'
+            'and inspect its errors. Does not scan files, contact Dropbox or recompute\n'
+            'discrepancies. Returns the selected scan result\'s exit code.',
+            'python3 dropbox_audit.py --db audit.sqlite report --csv saved-report.csv\n'
+            '  python3 dropbox_audit.py --db audit.sqlite report --scan 2 --json scan-2.json',
+        ),
+    }
+    for name, (brief, description, example) in descriptions.items():
+        command = sub.add_parser(name, help=brief, description=description,
+                                 formatter_class=formatter,
+                                 epilog='Examples:\n  ' + example + '\n\n'
+                                        'Report paths must be outside the backup and must not already exist.\n'
+                                        'Exit codes: 0 = match/success, 1 = discrepancies, 2 = incomplete/error.')
+        command.add_argument('--csv', metavar='FILE',
+                             help='Create a detailed UTF-8 discrepancy CSV. Matching files appear only in summary counts.')
+        command.add_argument('--json', metavar='FILE',
+                             help='Create a JSON summary and all discrepancies, unaffected by CSV filters.')
+        command.add_argument('--csv-omit-remote-only', action='store_true',
+                             help='Omit CSV rows for paths present only remotely, including extra files/directories and remote-only unverified entries. Does not change counts or exit codes.')
+        command.add_argument('--csv-omit-baseline-changes', action='store_true',
+                             help='Omit local_baseline_changed rows from CSV only; other discrepancies for the same path remain.')
+        if name == 'report':
+            command.add_argument('--scan', type=int, metavar='ID',
+                                 help='Select a saved scan ID from history, including incomplete scans, instead of the default result.')
+        if name in ('local', 'initial', 'quick', 'full'):
+            command.add_argument('--ignore-hidden', action='store_true',
+                                 help="Skip local files whose names start with '.', including ._ files. Still traverse hidden directories. Pass on every scan where desired; remote-only dotfiles may still be reported.")
+        if name == 'local':
+            command.add_argument('--full', action='store_true',
+                                 help='Rehash all local files regardless of cached size/mtime. Does not contact Dropbox.')
+        if name in ('initial', 'quick', 'full'):
+            command.add_argument('--rebuild-remote', action='store_true',
+                                 help='Ignore the saved cursor and fetch a fresh complete remote listing (use after cursor expiry). Already implicit in initial and full; trusted state survives listing failure.')
+    sub.add_parser(
+        'history', help='List scan IDs, modes, timestamps and completion status.',
+        description='Print saved scan history as one JSON object per scan.\n'
+                    'Use an ID with report --scan ID to inspect its saved result or errors.',
+        formatter_class=formatter,
+        epilog='Example:\n  python3 dropbox_audit.py --db audit.sqlite history\n'
+               '  python3 dropbox_audit.py --db audit.sqlite report --scan 2\n\n'
+               'Does not scan files or contact Dropbox. Returns 0 on success, 2 on error.',
+    )
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments, execute the selected operation and return its exit code.
 
@@ -468,30 +618,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     offline compare and report require no backup mount or Dropbox credentials.
     Record scan failures without exposing SDK request details or credentials.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--db', required=True, type=Path)
-    parser.add_argument('-v', '--verbose', action='store_true')
-    sub = parser.add_subparsers(dest='command', required=True)
-    init = sub.add_parser('init')
-    init.add_argument('--local-root', required=True, type=Path)
-    init.add_argument('--dropbox-root', required=True)
-    for name in ('initial', 'quick', 'full', 'local', 'compare', 'report'):
-        command = sub.add_parser(name)
-        command.add_argument('--csv')
-        command.add_argument('--json')
-        command.add_argument('--csv-omit-remote-only', action='store_true',
-                             help='Omit CSV rows for paths present only in the remote catalogue')
-        command.add_argument('--csv-omit-baseline-changes', action='store_true',
-                             help='Omit local_baseline_changed rows from CSV')
-        if name == 'report':
-            command.add_argument('--scan', type=int, help='Include failed scan diagnostics by scan ID')
-        if name in ('local', 'initial', 'quick', 'full'):
-            command.add_argument('--ignore-hidden', action='store_true', help="Skip local files whose names begin with '.'; still traverse hidden directories")
-        if name == 'local':
-            command.add_argument('--full', action='store_true', help='Rehash every local file')
-        if name not in ('local', 'compare', 'report'):
-            command.add_argument('--rebuild-remote', action='store_true')
-    sub.add_parser('history')
+    parser = build_parser()
     args = parser.parse_args(argv)
     csv_options: dict[str, bool] = {
         'csv_omit_remote_only': getattr(args, 'csv_omit_remote_only', False),
