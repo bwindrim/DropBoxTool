@@ -396,6 +396,69 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(saved['summary']['discrepancies']['extra_remotely'], 1)
             self.assertEqual(self.db.execute('SELECT count(*) FROM issues WHERE scan=2').fetchone()[0], original_count)
 
+    def test_duplicates_offline_reports_and_preserves_catalogue(self):
+        import contextlib
+        import csv
+        import io
+        import json
+        audit.put(self.db, 'local_root', self.root)
+        audit.put(self.db, 'dropbox_root', '/Photos')
+        # Overall scan status may be incomplete despite a trusted remote snapshot.
+        self.db.execute("INSERT INTO scans VALUES (1,'initial',1,2,'incomplete',NULL)")
+        audit.put(self.db, 'remote_scan', 1)
+        audit.put(self.db, 'cursor', 'trusted')
+        for path, size, digest in [('a', 3, 'hash'), ('nested/b', 3, 'hash'),
+                                   ('different-size', 4, 'hash'), ('empty', 0, 'empty-hash'),
+                                   ('empty-copy', 0, 'empty-hash')]:
+            audit.entry(self.db, 1, 'remote', path, 'file', size=size, hash=digest, file_id='id:' + path)
+        audit.entry(self.db, 1, 'remote', 'folder', 'folder')
+        audit.entry(self.db, 1, 'local', 'local-only', 'file', size=3, hash='hash')
+        # A newer untrusted snapshot must not be used.
+        audit.entry(self.db, 2, 'remote', 'untrusted', 'file', size=3, hash='hash')
+        self.db.commit()
+        before = list(self.db.iterdump())
+        json_path = Path(self.temp.name) / 'duplicates.json'
+        csv_path = Path(self.temp.name) / 'duplicates.csv'
+        database = str(Path(self.temp.name) / 'catalogue.db')
+        self.root.rename(Path(self.temp.name) / 'unmounted')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.dict(os.environ, {}, clear=True), patch('dropbox.Dropbox', side_effect=AssertionError('Dropbox accessed')), patch.object(audit, 'local_scan', side_effect=AssertionError('local scanned')):
+            self.assertEqual(audit.main(['--db', database, 'duplicates', '--json', str(json_path), '--csv', str(csv_path)]), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result, json.loads(json_path.read_text()))
+        self.assertEqual(result['summary']['source']['id'], 1)
+        self.assertEqual(result['summary']['dropbox_root'], '/Photos')
+        self.assertEqual(result['summary']['files_scanned'], 5)
+        self.assertEqual(result['summary']['duplicate_groups'], 2)
+        self.assertEqual(result['summary']['redundant_bytes'], 3)
+        with csv_path.open(newline='') as source:
+            self.assertEqual(len(list(csv.DictReader(source))), 4)
+        self.assertEqual(list(self.db.iterdump()), before)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit.main(['--db', database, 'duplicates', '--json', str(json_path)]), 2)
+
+    def test_duplicates_missing_empty_and_unverified(self):
+        import contextlib
+        import io
+        import json
+        with self.assertRaisesRegex(ValueError, 'No saved remote catalogue'):
+            audit.duplicates_report(self.db)
+        audit.put(self.db, 'remote_scan', 1)
+        audit.put(self.db, 'dropbox_root', '')
+        self.db.execute("INSERT INTO scans VALUES (1,'full',1,2,'complete',NULL)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(audit.duplicates_report(self.db), 0)
+        audit.entry(self.db, 1, 'remote', 'no-hash', 'file', size=3)
+        audit.entry(self.db, 1, 'remote', 'bad', 'file', size=3, hash='hash', error='unverified')
+        audit.entry(self.db, 1, 'remote', 'good', 'file', size=3, hash='hash')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(audit.duplicates_report(self.db), 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['summary']['unverified_files'], 2)
+        self.assertFalse(result['summary']['complete'])
+        self.assertEqual(result['groups'], [])
+
     def test_safe_output(self):
         with self.assertRaises(ValueError):
             audit.safe_output(self.root / 'db', self.root, Path('/other'))

@@ -332,3 +332,33 @@ on exit; duplicate groups and unverified paths are assembled in memory for outpu
 No audit database or local backup is needed or changed. Listings are observations
 of a changing account, not an atomic snapshot; keep the tree quiet for stable
 results. Only folders visible through the authorized Dropbox namespace are covered.
+
+## Find duplicates in a saved audit catalogue
+
+Use the auditor's `duplicates` command to find identical remote files without
+contacting Dropbox, rescanning either tree, or requiring a mounted local backup:
+
+```sh
+python3 dropbox_audit.py --db audit.sqlite duplicates
+python3 dropbox_audit.py --db audit.sqlite duplicates --csv duplicates.csv --json duplicates.json
+```
+
+The command uses the last trusted remote snapshot (`remote_scan`) saved by
+`initial`, `quick` or `full`, even if that scan later failed during comparison.
+It covers only the configured Dropbox root and reflects saved metadata, not the
+current account. Run a remote scanning command first if no snapshot exists, or
+to refresh stale data. Source scan timestamps and the Dropbox root appear in the
+output; file paths are relative to that root.
+
+Files with equal size and content hash form duplicate groups, including empty
+files. JSON on standard output includes groups, member paths and IDs, redundant
+copy/byte totals, and unverified paths. CSV exports one row per duplicate member;
+JSON exports the complete result. Redundant bytes count all but one copy per group,
+not predicted Dropbox quota savings. Files with missing hashes/sizes or saved
+errors are excluded from groups and reported as unverified. Exit codes are
+0 for no duplicates, 1 for duplicates, and 2 for incomplete data or errors.
+
+Reports require new filenames outside the local backup. CSV filenames should be
+imported as text in spreadsheets. This command does not change saved snapshots,
+cursors, comparison results, baselines or scan history. Groups and unverified
+paths are assembled in memory for reporting.

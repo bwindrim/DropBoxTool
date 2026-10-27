@@ -459,6 +459,54 @@ def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = Non
             target.write(']}\n')
 
 
+def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
+                      json_path: FilePath | None = None) -> int:
+    """Report duplicate content in the last trusted remote snapshot, entirely offline."""
+    source = setting(db, 'remote_scan')
+    if source is None:
+        raise ValueError('No saved remote catalogue; run initial or full first')
+    row = db.execute('SELECT id,mode,started,finished,status FROM scans WHERE id=?', (source,)).fetchone()
+    if row is None:
+        raise ValueError('Saved remote catalogue refers to an unknown scan')
+    groups = []
+    valid = "scan=? AND side='remote' AND kind='file' AND error IS NULL AND hash IS NOT NULL AND hash<>'' AND size IS NOT NULL AND size>=0"
+    for size, digest, count in db.execute(
+        'SELECT size,hash,count(*) FROM entries WHERE ' + valid +
+        ' GROUP BY size,hash HAVING count(*)>1 ORDER BY size DESC,hash', (source,)
+    ):
+        files = [dict(item) for item in db.execute(
+            'SELECT path,file_id FROM entries WHERE ' + valid + ' AND size=? AND hash=? ORDER BY path',
+            (source, size, digest))]
+        groups.append({'content_hash': digest, 'size': size, 'copies': count,
+                       'redundant_bytes': size * (count - 1), 'files': files})
+    unverified = [dict(item) for item in db.execute(
+        "SELECT path,error FROM entries WHERE scan=? AND side='remote' AND kind='file' "
+        "AND (error IS NOT NULL OR hash IS NULL OR hash='' OR size IS NULL OR size<0) ORDER BY path", (source,))]
+    summary = {
+        'source': dict(row), 'dropbox_root': required_setting(db, 'dropbox_root') or '/',
+        'remote_state_note': 'Saved Dropbox metadata only; Dropbox has not been contacted. Paths are relative to dropbox_root.',
+        'files_scanned': db.execute("SELECT count(*) FROM entries WHERE scan=? AND side='remote' AND kind='file'", (source,)).fetchone()[0],
+        'duplicate_groups': len(groups), 'duplicate_files': sum(g['copies'] for g in groups),
+        'redundant_copies': sum(g['copies'] - 1 for g in groups),
+        'redundant_bytes': sum(g['redundant_bytes'] for g in groups),
+        'unverified_files': len(unverified), 'complete': not unverified,
+    }
+    result = {'summary': summary, 'groups': groups, 'unverified': unverified}
+    if csv_path:
+        with open(csv_path, 'x', newline='', encoding='utf-8') as target:
+            writer = csv.writer(target)
+            writer.writerow(['group', 'content_hash', 'size', 'copies', 'file_id', 'path'])
+            for number, group in enumerate(groups, 1):
+                for item in group['files']:
+                    writer.writerow([number, group['content_hash'], group['size'], group['copies'], item['file_id'], item['path']])
+    if json_path:
+        with open(json_path, 'x', encoding='utf-8') as target:
+            json.dump(result, target, indent=2)
+            target.write('\n')
+    print(json.dumps(result, indent=2))
+    return 2 if unverified else int(bool(groups))
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build command help for setup, scanning, updates and saved reports."""
     formatter = argparse.RawDescriptionHelpFormatter
@@ -597,6 +645,17 @@ folder path in the app's accessible namespace. Use a new database to change root
         if name in ('initial', 'quick', 'full'):
             command.add_argument('--rebuild-remote', action='store_true',
                                  help='Ignore the saved cursor and fetch a fresh complete remote listing (use after cursor expiry). Already implicit in initial and full; trusted state survives listing failure.')
+    duplicates = sub.add_parser(
+        'duplicates', help='Find duplicate files in the saved remote catalogue, offline.',
+        description='Group files by size and content hash in the last trusted remote snapshot.\n'
+                    'No Dropbox credentials or mounted backup are required. No catalogue data is changed.',
+        formatter_class=formatter,
+        epilog='Example:\n  python3 dropbox_audit.py --db audit.sqlite duplicates --csv duplicates.csv\n\n'
+               'Paths are relative to the configured Dropbox root. Reports require new filenames\n'
+               'outside the backup. Exit: 0 = no duplicates, 1 = duplicates, 2 = incomplete/error.',
+    )
+    duplicates.add_argument('--csv', metavar='FILE', help='Create a CSV with one row per duplicate member.')
+    duplicates.add_argument('--json', metavar='FILE', help='Create a full JSON duplicate report, including unverified paths.')
     sub.add_parser(
         'history', help='List scan IDs, modes, timestamps and completion status.',
         description='Print saved scan history as one JSON object per scan.\n'
@@ -663,6 +722,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             for row in db.execute('SELECT * FROM scans ORDER BY id'):
                 print(json.dumps(dict(row)))
             return 0
+        if args.command == 'duplicates':
+            return duplicates_report(db, csv_path, json_path)
         if args.command == 'report':
             scan_id = args.scan or setting(db, 'comparison_scan') or setting(db, 'local_scan')
             if not scan_id:
