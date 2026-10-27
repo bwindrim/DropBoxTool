@@ -292,3 +292,43 @@ rehashing, excluded links and permissions, comparison categories, collisions,
 historical baseline changes, pagination, transactional API failure and recursive
 deletions. Live OAuth and account-specific shared-folder permissions require a
 real-account smoke test; no live Dropbox scan is run by the tests.
+
+# Remote Dropbox duplicate scanner
+
+`dropbox_duplicates.py` recursively scans the entire accessible Dropbox tree by
+ default, or only the folders supplied as positional arguments. It finds identical
+file contents across all selected folders using **both size and Dropbox content
+hash**, regardless of filename. It reads metadata only; it never downloads,
+modifies or deletes remote files. Use the dependencies and `files.metadata.read`
+OAuth setup above. App-folder credentials can only see that app folder.
+
+```sh
+export DROPBOX_ACCESS_TOKEN='your-token'
+python3 dropbox_duplicates.py
+python3 dropbox_duplicates.py /Photos /Documents/Archive
+python3 dropbox_duplicates.py /Photos /Documents --json duplicates.json --csv duplicates.csv
+```
+
+Refresh credentials are also supported through `DROPBOX_REFRESH_TOKEN` and
+`DROPBOX_APP_KEY`, plus `DROPBOX_APP_SECRET` for confidential apps. Use `/` for
+the account root; relative folder paths gain a leading slash. Selected folders
+include all descendants; overlapping selections are collapsed and repeated file
+IDs are counted once. Duplicate groups can span different selected folders.
+
+Standard output is JSON with a summary, duplicate groups (hash, size, copy count,
+file IDs and paths), and paths of unverified files without content hashes.
+`redundant_bytes` counts all but one copy per group; it is a logical byte count,
+not a prediction of Dropbox quota savings. Empty files are included. Optional
+JSON and CSV reports require new filenames. CSV contains one row per duplicate
+member; import paths as text when opening untrusted filenames in a spreadsheet.
+
+Exit codes: **0** complete with no duplicates, **1** complete with duplicates,
+**2** incomplete or operational error. Missing hashes produce exit 2 while still
+reporting known duplicate groups. A failed request produces no successful scan
+report. Pagination and bounded retries follow the auditor's request helper;
+`--timeout SECONDS` changes the default 30-second request timeout and `-v` logs
+metadata pages. Scanning uses a temporary SQLite catalogue, automatically removed
+on exit; duplicate groups and unverified paths are assembled in memory for output.
+No audit database or local backup is needed or changed. Listings are observations
+of a changing account, not an atomic snapshot; keep the tree quiet for stable
+results. Only folders visible through the authorized Dropbox namespace are covered.
