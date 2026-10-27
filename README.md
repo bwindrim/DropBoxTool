@@ -378,3 +378,14 @@ unknown folders, file paths, and `.` or `..` components are rejected. Matching i
 case insensitive and treats wildcard characters literally. Overlapping selections
 count each file once. Groups can span selected folders; counts, unverified paths,
 exit codes and both exports all reflect only the selected scope.
+
+Add `--ignore-empty` to exclude zero-sized files from the duplicate check,
+summary counts, unverified paths and exports:
+
+```sh
+python3 dropbox_audit.py --db audit.sqlite duplicates --ignore-empty
+python3 dropbox_audit.py --db audit.sqlite duplicates Holidays --ignore-empty --csv duplicates.csv
+```
+
+Empty files are included by default. Files with unknown sizes remain unverified;
+the option does not change stored metadata. The JSON summary records `ignore_empty`.

@@ -461,7 +461,7 @@ def report(db: sqlite3.Connection, scan: ScanId, csv_path: FilePath | None = Non
 
 def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
                       json_path: FilePath | None = None, *,
-                      directories: Sequence[str] = ()) -> int:
+                      directories: Sequence[str] = (), ignore_empty: bool = False) -> int:
     """Report duplicate content in the last trusted remote snapshot, entirely offline."""
     source = setting(db, 'remote_scan')
     if source is None:
@@ -482,6 +482,8 @@ def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
         roots.append(directory)
     # Match literal directory boundaries; SQL LIKE would treat % and _ as wildcards.
     scope = "scan=? AND side='remote' AND kind='file'"
+    if ignore_empty:
+        scope += ' AND (size IS NULL OR size<>0)'
     parameters: list[Any] = [source]
     if roots and '' not in roots:
         scope += ' AND (' + ' OR '.join('substr(norm,1,?)=?' for _ in roots) + ')'
@@ -505,6 +507,7 @@ def duplicates_report(db: sqlite3.Connection, csv_path: FilePath | None = None,
     summary = {
         'source': dict(row), 'dropbox_root': required_setting(db, 'dropbox_root') or '/',
         'subdirectories': roots or ['/'],
+        'ignore_empty': ignore_empty,
         'remote_state_note': 'Saved Dropbox metadata only; Dropbox has not been contacted. Paths are relative to dropbox_root.',
         'files_scanned': db.execute('SELECT count(*) FROM entries WHERE ' + scope, parameters).fetchone()[0],
         'duplicate_groups': len(groups), 'duplicate_files': sum(g['copies'] for g in groups),
@@ -679,6 +682,8 @@ folder path in the app's accessible namespace. Use a new database to change root
     duplicates.add_argument('directories', nargs='*', metavar='SUBDIRECTORY',
                             help='Restrict to these saved folders and descendants, relative to the configured Dropbox root (optional leading slash). Default: entire saved tree.')
     duplicates.add_argument('--json', metavar='FILE', help='Create a full JSON duplicate report, including unverified paths.')
+    duplicates.add_argument('--ignore-empty', action='store_true',
+                            help='Exclude zero-sized files from duplicate checks, counts and reports. Unknown sizes remain unverified.')
     sub.add_parser(
         'history', help='List scan IDs, modes, timestamps and completion status.',
         description='Print saved scan history as one JSON object per scan.\n'
@@ -746,7 +751,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(dict(row)))
             return 0
         if args.command == 'duplicates':
-            return duplicates_report(db, csv_path, json_path, directories=args.directories)
+            return duplicates_report(db, csv_path, json_path, directories=args.directories,
+                                     ignore_empty=args.ignore_empty)
         if args.command == 'report':
             scan_id = args.scan or setting(db, 'comparison_scan') or setting(db, 'local_scan')
             if not scan_id:

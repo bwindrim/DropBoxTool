@@ -496,6 +496,33 @@ class AuditTests(unittest.TestCase):
         args = audit.build_parser().parse_args(['--db', 'audit.sqlite', 'duplicates', 'A', 'B', '--csv', 'out.csv'])
         self.assertEqual(args.directories, ['A', 'B'])
 
+    def test_duplicates_ignore_empty(self):
+        import contextlib
+        import io
+        import json
+        audit.put(self.db, 'remote_scan', 1)
+        audit.put(self.db, 'dropbox_root', '')
+        self.db.execute("INSERT INTO scans VALUES (1,'full',1,2,'complete',NULL)")
+        for path in ('empty', 'empty-copy'):
+            audit.entry(self.db, 1, 'remote', path, 'file', size=0, hash='empty-hash')
+        audit.entry(self.db, 1, 'remote', 'empty-no-hash', 'file', size=0)
+        audit.entry(self.db, 1, 'remote', 'nonempty', 'file', size=3, hash='hash')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(audit.duplicates_report(self.db), 2)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(audit.duplicates_report(self.db, ignore_empty=True), 0)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result['summary']['ignore_empty'])
+        self.assertEqual(result['summary']['files_scanned'], 1)
+        self.assertEqual(result['groups'], [])
+        self.assertEqual(result['unverified'], [])
+        audit.entry(self.db, 1, 'remote', 'unknown-size', 'file', hash='hash')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(audit.duplicates_report(self.db, ignore_empty=True), 2)
+        args = audit.build_parser().parse_args(['--db', 'audit.sqlite', 'duplicates', '--ignore-empty'])
+        self.assertTrue(args.ignore_empty)
+
     def test_safe_output(self):
         with self.assertRaises(ValueError):
             audit.safe_output(self.root / 'db', self.root, Path('/other'))
